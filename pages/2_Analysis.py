@@ -31,7 +31,8 @@ AD_MEMORY_BANK_PATH = ROOT_DIR / "data" / "memory_bank" / "MB.npy"
 AD_HEATMAP_RANGE_PATH = ROOT_DIR / "data" / "memory_bank" / "heatmap_range.json"
 AD_OUTPUT_DIR = ROOT_DIR / "outputs" / "AD"
 
-from scripts.detail_finetune_mcp import resolve_base_model_dir
+from scripts.classification.classifier_runtime import get_default_classifier_runtime
+from scripts.detail_finetune_mcp import CLASSIFIER_MODEL_DIR, resolve_base_model_dir
 from scripts.utils import (
     CLASS_VISUALIZATION_ORDER,
     _append_app_log,
@@ -170,7 +171,31 @@ def _save_inference_timing(
     output_timing_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _load_detail_classifier_runtime(model_dir: Path) -> tuple[Any, Any, str, float]:
+class _TorchClassifierHandle:
+    """Adapts an AutoModelForImageClassification model to the preprocess()/infer_label()
+    interface shared with the default TensorRT/ONNX runtime (see _load_detail_classifier_runtime),
+    so the reinference loop below doesn't need to special-case either backend."""
+
+    def __init__(self, image_processor: Any, model: Any, device: str) -> None:
+        import torch
+
+        self._torch = torch
+        self.processor = image_processor
+        self.model = model
+        self.device = device
+
+    def preprocess(self, image: Any) -> Any:
+        inputs = self.processor(images=image, return_tensors="pt")
+        return {key: value.to(self.device) for key, value in inputs.items()}
+
+    def infer_label(self, inputs: Any) -> str:
+        with self._torch.no_grad():
+            logits = self.model(**inputs).logits
+        predicted_index = int(logits.argmax(dim=-1).item())
+        return str(self.model.config.id2label[predicted_index])
+
+
+def _load_detail_torch_classifier_runtime(model_dir: Path) -> tuple[Any, Any, str, float]:
     try:
         import torch
 
@@ -218,6 +243,29 @@ def _load_detail_classifier_runtime(model_dir: Path) -> tuple[Any, Any, str, flo
     )
 
 
+def _load_detail_classifier_runtime(model_dir: Path) -> tuple[Any, str, float]:
+    """Prediction runtime for the Result/Run flow: the default classifier model_dir (the app's
+    normal case) uses the GPU(TensorRT)/CPU(ONNX) engine; any other, explicitly-selected model_dir
+    (e.g. a fine-tuned checkpoint from the Fine-tuning page) keeps using the original torch model,
+    since only the default model has a compiled engine/ONNX export."""
+    resolved_model_dir = resolve_base_model_dir(model_dir)
+
+    if resolved_model_dir == resolve_base_model_dir(CLASSIFIER_MODEL_DIR):
+        load_start_ns = time.perf_counter_ns()
+        runtime = get_default_classifier_runtime()
+        initial_model_load_time_milliseconds = (time.perf_counter_ns() - load_start_ns) / 1_000_000.0
+        return runtime, runtime.device, initial_model_load_time_milliseconds
+
+    image_processor, model, device_name, initial_model_load_time_milliseconds = _load_detail_torch_classifier_runtime(
+        resolved_model_dir
+    )
+    return (
+        _TorchClassifierHandle(image_processor, model, device_name),
+        device_name,
+        initial_model_load_time_milliseconds,
+    )
+
+
 def _predict_detail_records_with_model(
     selected_records: list[dict[str, Any]],
     model_dir: Path,
@@ -229,15 +277,11 @@ def _predict_detail_records_with_model(
     )
 
     try:
-        import torch
         from PIL import Image
     except ImportError as exc:
         raise RuntimeError("The Pillow package required for image reinference is not installed.") from exc
 
-    image_processor, model, device_name, initial_model_load_time_milliseconds = _load_detail_classifier_runtime(
-        resolved_model_dir
-    )
-    device = torch.device(device_name)
+    handle, device_name, initial_model_load_time_milliseconds = _load_detail_classifier_runtime(resolved_model_dir)
     predicted_records: list[dict[str, Any]] = []
     prediction_errors: list[str] = []
     per_image_preprocess_times_milliseconds: dict[str, float] = {}
@@ -246,41 +290,39 @@ def _predict_detail_records_with_model(
     total_start_ns = time.perf_counter_ns()
 
     def _sync_if_needed() -> None:
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        if device_name == "cuda":
+            import torch
+
+            torch.cuda.synchronize()
 
     with st.spinner(f"Running inference again on the selected images with {resolved_model_dir.name}..."):
-        with torch.no_grad():
-            for record in selected_records:
-                updated_record = dict(record)
-                updated_record["model_dir"] = str(resolved_model_dir)
-                updated_record["model_dir_display"] = _to_project_relative_path(resolved_model_dir)
+        for record in selected_records:
+            updated_record = dict(record)
+            updated_record["model_dir"] = str(resolved_model_dir)
+            updated_record["model_dir_display"] = _to_project_relative_path(resolved_model_dir)
 
-                if not updated_record.get("exists"):
-                    predicted_records.append(updated_record)
-                    continue
-
-                try:
-                    preprocess_start_ns = time.perf_counter_ns()
-                    with Image.open(updated_record["path"]) as image:
-                        rgb_image = image.convert("RGB")
-                    inputs = image_processor(images=rgb_image, return_tensors="pt")
-                    inputs = {key: value.to(device) for key, value in inputs.items()}
-                    preprocess_time_milliseconds = (time.perf_counter_ns() - preprocess_start_ns) / 1_000_000.0
-                    _sync_if_needed()
-                    inference_start_ns = time.perf_counter_ns()
-                    logits = model(**inputs).logits
-                    predicted_index = logits.argmax(dim=-1).item()
-                    _sync_if_needed()
-                    inference_time_milliseconds = (time.perf_counter_ns() - inference_start_ns) / 1_000_000.0
-                    updated_record["label"] = str(model.config.id2label[predicted_index])
-                    relative_image_path = _to_project_relative_path(updated_record["path"])
-                    prediction_results[updated_record["path"]] = updated_record["label"]
-                    per_image_preprocess_times_milliseconds[relative_image_path] = preprocess_time_milliseconds
-                    per_image_inference_times_milliseconds[relative_image_path] = inference_time_milliseconds
-                except Exception as exc:
-                    prediction_errors.append(f"{Path(updated_record['path']).name}: {exc}")
+            if not updated_record.get("exists"):
                 predicted_records.append(updated_record)
+                continue
+
+            try:
+                preprocess_start_ns = time.perf_counter_ns()
+                with Image.open(updated_record["path"]) as image:
+                    rgb_image = image.convert("RGB")
+                inputs = handle.preprocess(rgb_image)
+                preprocess_time_milliseconds = (time.perf_counter_ns() - preprocess_start_ns) / 1_000_000.0
+                _sync_if_needed()
+                inference_start_ns = time.perf_counter_ns()
+                updated_record["label"] = handle.infer_label(inputs)
+                _sync_if_needed()
+                inference_time_milliseconds = (time.perf_counter_ns() - inference_start_ns) / 1_000_000.0
+                relative_image_path = _to_project_relative_path(updated_record["path"])
+                prediction_results[updated_record["path"]] = updated_record["label"]
+                per_image_preprocess_times_milliseconds[relative_image_path] = preprocess_time_milliseconds
+                per_image_inference_times_milliseconds[relative_image_path] = inference_time_milliseconds
+            except Exception as exc:
+                prediction_errors.append(f"{Path(updated_record['path']).name}: {exc}")
+            predicted_records.append(updated_record)
 
     artifact_paths: dict[str, str] | None = None
     if prediction_results:
@@ -1006,7 +1048,7 @@ def _render_detail_xai_visualization(
     st.caption(f"{total_images} images total | Page {current_xai_page}/{xai_total_pages}")
 
     try:
-        image_processor, base_model, device_name, _ = _load_detail_classifier_runtime(selected_model_dir)
+        image_processor, base_model, device_name, _ = _load_detail_torch_classifier_runtime(selected_model_dir)
         device = torch.device(device_name)
 
         class _OpenXAILogitsModel(torch.nn.Module):
@@ -1084,7 +1126,7 @@ def _render_detail_xai_visualization(
 
     for item in page_items:
         st.markdown(f"**{item['filename']}**")
-        c1, c2, c3 = st.columns(3)
+        _, c1, c2, c3, _ = st.columns([0.5, 1, 1, 1, 0.5])
         with c1:
             st.image(item["original"], caption="Original", width="stretch")
         with c2:
@@ -1548,7 +1590,7 @@ def _render_ad_xai_visualization(
         )
 
         st.markdown(f"**{record['filename']}** &nbsp;|&nbsp; Anomaly score: `{image_score:.4f}` &nbsp;|&nbsp; Prediction: **{label}**")
-        c1, c2, c3 = st.columns(3)
+        _, c1, c2, c3, _ = st.columns([0.5, 1, 1, 1, 0.5])
         with c1:
             st.image((original_np * 255).astype(np.uint8), caption="Original", width="stretch")
         with c2:
@@ -1749,7 +1791,7 @@ def render_detail_page(image_records) -> None:
         st.caption("Interactive fine-tuning can be run on the `Fine-tuning` page.")
 
 
-configure_page("Detail")
+configure_page("Analysis")
 if not bool(st.session_state.get("dashboard_data_loaded", False)):
     st.info("Please go to the Dashboard page and click **Load Data** first.")
     st.stop()

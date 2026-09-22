@@ -26,8 +26,13 @@ from scripts.local_gemma_model import (
 from scripts.utils import (
     CLASS_VISUALIZATION_ORDER,
     PDF_FONT_CANDIDATES,
+    _apply_inference_labels_to_records,
+    _build_runs_from_labeled_records,
     _get_discrete_class_colors,
     _get_llm_runtime_settings,
+    _read_classification_inference_cache,
+    _run_classification_inference_for_paths,
+    _to_project_relative_path,
     build_aggregate_run,
     build_label_distribution_frame,
     configure_page,
@@ -712,8 +717,81 @@ def _build_report_period_range(
     return summary_run["timestamp"].strftime("%Y-%m-%d")
 
 
+def _resolve_query_period(config: dict[str, Any]) -> tuple[str | None, str | None]:
+    query_date_start = str(config.get("query_date_start", "") or "").strip()
+    query_date_end = str(config.get("query_date_end", "") or "").strip()
+    if query_date_start in {"", "all", "not_loaded"}:
+        query_date_start = None
+    if query_date_end in {"", "all", "not_loaded"}:
+        query_date_end = None
+    return query_date_start, query_date_end
+
+
+def render_classification_inference_section(
+    config: dict[str, Any],
+    image_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Classify the current query period's images with the default classifier and let the
+    rest of the Summary page render off the classification results instead of the stored labels.
+
+    Results are cached to disk (see CLASSIFICATION_INFERENCE_CACHE_PATH in scripts/utils.py) keyed
+    by image path, so images already classified in a previous run/session are read back from the
+    cache instead of being re-run through the model; only images missing from the cache require a
+    manual **Run Inference** click.
+    """
+    query_date_start, query_date_end = _resolve_query_period(config)
+    period_caption = f"{query_date_start} ~ {query_date_end}" if query_date_start and query_date_end else "All dates"
+
+    candidate_paths = [record["path"] for record in image_records if record.get("exists")]
+    cached_lookup = _read_classification_inference_cache()
+    pending_count = sum(1 for path in candidate_paths if _to_project_relative_path(path) not in cached_lookup)
+
+    with st.container(border=True):
+        st.subheader("Classification Inference")
+        st.caption(
+            f"Query period: {period_caption} | {len(candidate_paths)} image(s) in range | "
+            f"{pending_count} pending inference"
+        )
+        run_clicked = st.button(
+            "Run Inference",
+            key="summary_run_inference_button",
+            disabled=not candidate_paths,
+        )
+        if run_clicked:
+            with st.spinner("Classifying this period's images..."):
+                label_by_path, cached_count, inferred_count = _run_classification_inference_for_paths(
+                    candidate_paths
+                )
+            st.session_state["summary_inference_label_by_path"] = label_by_path
+            st.session_state["summary_inference_signature"] = (query_date_start, query_date_end)
+            st.success(f"Inference complete: {inferred_count} newly inferred, {cached_count} loaded from cache.")
+
+        if st.session_state.get("summary_inference_signature") == (query_date_start, query_date_end):
+            label_by_path = st.session_state.get("summary_inference_label_by_path", {})
+        elif candidate_paths and pending_count == 0:
+            # Every image in this period is already in the on-disk cache from a previous run, so
+            # apply it without requiring another click.
+            label_by_path = {
+                path: cached_lookup[_to_project_relative_path(path)]
+                for path in candidate_paths
+                if _to_project_relative_path(path) in cached_lookup
+            }
+        else:
+            label_by_path = {}
+
+        if label_by_path:
+            return _apply_inference_labels_to_records(image_records, label_by_path), True
+
+        st.info("Showing stored labels. Click **Run Inference** to classify this period's images with the classification model.")
+        return image_records, False
+
+
 def render_summary_page(config, runs, image_records) -> None:
     render_page_header("Summary")
+
+    image_records, inference_applied = render_classification_inference_section(config, image_records)
+    if inference_applied:
+        runs = _build_runs_from_labeled_records(image_records)
 
     summary_run = build_aggregate_run(runs)
     trends = build_trend_data(summary_run)
