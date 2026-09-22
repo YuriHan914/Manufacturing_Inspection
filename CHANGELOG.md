@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v0.6.0] - 2026-09-22
+
+### Changed
+
+* Converted the classification model (JAX-trained MobileViT-S) to ONNX and TensorRT engine formats for inference — the app now runs on a TensorRT engine (GPU) with an ONNX Runtime (CPU) fallback instead of the raw JAX/PyTorch model
+
+---
+
 ## [v0.5.0] - 2026-08-04
 
 ### Changed
