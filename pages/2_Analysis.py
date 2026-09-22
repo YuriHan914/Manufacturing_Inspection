@@ -1802,3 +1802,4 @@ _config, _runs, image_records, _log_entries = load_dashboard_data(
     query_date_end=_query_date_end,
 )
 render_detail_page(image_records)
+
