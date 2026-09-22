@@ -37,11 +37,10 @@ from scripts.detail_finetune_mcp import (
 from scripts.local_gemma_model import (
     MODEL_DIR as DEFAULT_LLM_MODEL_DIR,
     are_runtime_dependencies_available,
-    generate_response,
     is_model_downloaded,
     list_available_model_dirs,
 )
-from scripts.app_mcp import execute_app_mcp_tool, route_app_command
+from scripts.agent_graph import handle_user_command
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -63,11 +62,6 @@ SEVERITY_ORDER = {
     "System start": 6,
     "Model update": 7,
 }
-DEFAULT_GEMMA_SYSTEM_PROMPT = """You are a manufacturing dashboard assistant.
-Keep responses short, clear, and practical.
-When the user asks about process, quality, alarms, or settings, suggest actionable next steps when helpful.
-If the prompt includes the current dashboard state or Streamlit runtime context, prioritize that information.
-Do not guess about anything not present in the provided context. State clearly when information is unavailable."""
 SUMMARY_ANALYSIS_SYSTEM_PROMPT = """You are a quality analyst summarizing semiconductor inspection results.
 Respond only in English.
 Write a concise 4 to 6 sentence analysis comment based on the provided metrics, trends, and image information.
@@ -97,14 +91,6 @@ CLASS_VISUALIZATION_COLORS = {
     "Near-Full": "#007AFF",
     "Normal": "#AF52DE",
     "Scratch": "#FFD60A",
-}
-DETAIL_PREPROCESSING_LABELS = {
-    "none": "No preprocessing",
-    "light_augmentation": "Light augmentation",
-    "medium_augmentation": "Medium augmentation",
-    "heavy_augmentation": "Heavy augmentation",
-    "histogram_equalization": "Histogram equalization",
-    "denoise": "Denoise",
 }
 REQUIRED_CLASSIFIER_MODEL_FILES = (
     "model.safetensors",
@@ -843,21 +829,18 @@ def _get_cached_detail_inference_result(
 
 
 @st.cache_resource(show_spinner=False)
-def _load_dashboard_classifier_runtime(model_dir_value: str) -> tuple[Any, Any, str]:
-    try:
-        import torch
+def _load_dashboard_classifier_runtime(model_dir_value: str) -> tuple[Any, str]:
+    """Default classifier runtime used to auto-label freshly discovered images.
 
-        _suppress_transformers_path_alias_warning()
-        from transformers import AutoImageProcessor, AutoModelForImageClassification
-    except ImportError as exc:
-        raise RuntimeError("The torch/transformers packages required for dashboard inference are not installed.") from exc
+    Always serves the fixed GPU(TensorRT)/CPU(ONNX) MobileViT export from
+    scripts/classifier_runtime.py, regardless of `model_dir_value`; the argument is
+    kept only so the cache key/log messages stay attributable to `default_model_dir` the way the
+    rest of load_dashboard_data expects.
+    """
+    from scripts.classifier_runtime import get_default_classifier_runtime
 
-    resolved_model_dir = resolve_base_model_dir(model_dir_value)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    image_processor = AutoImageProcessor.from_pretrained(str(resolved_model_dir))
-    model = AutoModelForImageClassification.from_pretrained(str(resolved_model_dir)).to(device)
-    model.eval()
-    return image_processor, model, device
+    runtime = get_default_classifier_runtime()
+    return runtime, runtime.device
 
 
 @st.cache_data(show_spinner=False)
@@ -869,43 +852,31 @@ def _predict_dashboard_labels(
         return {}, 0.0, 0.0
 
     try:
-        import torch
         from PIL import Image
     except ImportError as exc:
-        raise RuntimeError("The torch/Pillow packages required for dashboard inference are not installed.") from exc
+        raise RuntimeError("The Pillow package required for dashboard inference is not installed.") from exc
 
-    image_processor, model, device_name = _load_dashboard_classifier_runtime(model_dir_value)
-    device = torch.device(device_name)
-
-    def _sync_if_needed() -> None:
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+    runtime, _device = _load_dashboard_classifier_runtime(model_dir_value)
 
     predicted_labels: dict[str, str] = {}
     total_process_ms = 0.0
     total_inference_ms = 0.0
 
-    with torch.no_grad():
-        for image_path in image_paths:
-            process_start_ns = time.perf_counter_ns()
+    for image_path in image_paths:
+        process_start_ns = time.perf_counter_ns()
 
-            with Image.open(image_path) as image:
-                rgb_image = image.convert("RGB")
+        with Image.open(image_path) as image:
+            rgb_image = image.convert("RGB")
 
-            inputs = image_processor(images=rgb_image, return_tensors="pt")
-            inputs = {key: value.to(device) for key, value in inputs.items()}
+        pixel_values = runtime.preprocess(rgb_image)
 
-            _sync_if_needed()
-            inference_start_ns = time.perf_counter_ns()
-            logits = model(**inputs).logits
-            predicted_index = logits.argmax(dim=-1).item()
-            _sync_if_needed()
+        inference_start_ns = time.perf_counter_ns()
+        predicted_labels[image_path] = runtime.infer_label(pixel_values)
+        inference_ms = (time.perf_counter_ns() - inference_start_ns) / 1_000_000.0
 
-            inference_ms = (time.perf_counter_ns() - inference_start_ns) / 1_000_000.0
-            process_ms = (time.perf_counter_ns() - process_start_ns) / 1_000_000.0
-            predicted_labels[image_path] = str(model.config.id2label[predicted_index])
-            total_inference_ms += inference_ms
-            total_process_ms += process_ms
+        process_ms = (time.perf_counter_ns() - process_start_ns) / 1_000_000.0
+        total_inference_ms += inference_ms
+        total_process_ms += process_ms
 
     average_inference_ms = total_inference_ms / len(image_paths) if image_paths else 0.0
     return predicted_labels, average_inference_ms, total_process_ms
@@ -1187,89 +1158,14 @@ def _collect_records_for_paths(
     return ordered_records
 
 
-def _build_sidebar_runtime_context(current_page_title: str | None = None) -> str:
-    config, runs, image_records, log_entries = load_dashboard_data()
-    summary_run = build_aggregate_run(runs)
-    lines: list[str] = []
-
-    lines.append(f"current_page: {current_page_title or st.session_state.get('current_page_title', '-')}")
-    lines.append(f"llm_model: {_to_project_relative_path(st.session_state.get('llm_model_dir'))}")
-    lines.append(
-        "llm_runtime: "
-        f"temperature={float(st.session_state.get('llm_temperature', DEFAULT_LLM_TEMPERATURE)):.1f}, "
-        f"max_new_tokens={int(st.session_state.get('llm_max_new_tokens', DEFAULT_LLM_MAX_NEW_TOKENS))}"
-    )
-    lines.append(f"configured_classifier_model: {_format_display_path(config.get('model_name', '-'))}")
-
-    if summary_run:
-        lines.append(
-            "dashboard_summary: "
-            f"total={int(summary_run['total_count'])}, "
-            f"good={int(summary_run['good_count'])}, "
-            f"bad={int(summary_run['bad_count'])}, "
-            f"avg_inference_ms={float(summary_run['average_inference_ms']):.2f}"
-        )
-        lines.append(f"class_distribution: {_summarize_label_counts(summary_run['label_counts'])}")
-    else:
-        lines.append("dashboard_summary: no_data")
-
-    recent_runs = runs[-5:]
-    if recent_runs:
-        recent_run_summary = "; ".join(
-            f"{run['name']}({int(run['total_count'])})"
-            for run in recent_runs
-        )
-        lines.append(f"recent_runs: {recent_run_summary}")
-
-    recent_logs = log_entries[:5]
-    if recent_logs:
-        log_summary = " | ".join(
-            f"{entry.get('time', '-')}/{entry.get('source', '-')}/{entry.get('log_type', '-')}: {entry.get('content', '')}"
-            for entry in recent_logs
-        )
-        lines.append(f"recent_logs: {log_summary}")
-
-    detail_selected_paths_raw = st.session_state.get("detail_multi_select_paths")
-    if not isinstance(detail_selected_paths_raw, list):
-        detail_selected_paths_raw = st.session_state.get("detail_selected_image_paths", [])
-    detail_selected_paths = [str(path) for path in detail_selected_paths_raw if str(path).strip()]
-    detail_selected_records = _collect_records_for_paths(image_records, detail_selected_paths)
-    lines.append(f"detail_selected_image_count: {len(detail_selected_records)}")
-    if detail_selected_records:
-        detail_selected_names = ", ".join(record["filename"] for record in detail_selected_records[:6])
-        lines.append(f"detail_selected_images: {detail_selected_names}")
-
-        active_detail_model = st.session_state.get("detail_inference_model_selector") or st.session_state.get(
-            "detail_inference_model_active"
-        )
-        if active_detail_model:
-            lines.append(f"detail_inference_model: {_to_project_relative_path(active_detail_model)}")
-            cached_records, cached_errors, cached_artifacts = _get_cached_detail_inference_result(
-                detail_selected_records,
-                Path(str(active_detail_model)),
-            )
-            if cached_records is not None:
-                prediction_counts = Counter(str(record.get("label", "-")) for record in cached_records)
-                lines.append(f"detail_cached_predictions: {_summarize_label_counts(dict(prediction_counts))}")
-                if cached_errors:
-                    lines.append(f"detail_cached_prediction_errors: {len(cached_errors)}")
-                if cached_artifacts:
-                    lines.append(
-                        f"detail_inference_results_path: {_to_project_relative_path(cached_artifacts['results_path'])}"
-                    )
-                    lines.append(
-                        f"detail_inference_timing_path: {_to_project_relative_path(cached_artifacts['timing_path'])}"
-                    )
-
-    fine_tuning_selected_paths = st.session_state.get("fine_tuning_page_selected_image_paths", [])
-    if isinstance(fine_tuning_selected_paths, list):
-        lines.append(f"fine_tuning_selected_image_count: {len(fine_tuning_selected_paths)}")
-
-    pending_llm_model = st.session_state.get("llm_model_dir_pending")
-    if pending_llm_model:
-        lines.append(f"pending_llm_model: {_to_project_relative_path(pending_llm_model)}")
-
-    return "\n".join(lines)
+def _submit_sidebar_prompt() -> None:
+    """on_click for the sidebar Send button — runs before the script reruns, so this is the
+    only safe place to clear the "gemma_sidebar_prompt" text_area's own session_state value.
+    (Setting it later, after the widget has already been instantiated this run, raises a
+    StreamlitAPIException.) The submitted text is stashed in a separate key for the
+    `if send_clicked:` block below to pick up."""
+    st.session_state["gemma_sidebar_pending_prompt"] = st.session_state.get("gemma_sidebar_prompt", "").strip()
+    st.session_state["gemma_sidebar_prompt"] = ""
 
 
 def render_sidebar_llm_panel(current_page_title: str | None = None) -> None:
@@ -1277,13 +1173,13 @@ def render_sidebar_llm_panel(current_page_title: str | None = None) -> None:
     st.session_state.setdefault("gemma_sidebar_notice", "")
     st.session_state.setdefault("gemma_sidebar_response", "")
     st.session_state.setdefault("gemma_sidebar_prompt", "")
+    st.session_state.setdefault("gemma_sidebar_pending_prompt", "")
     llm_settings = _get_llm_runtime_settings()
     selected_model_dir = Path(str(llm_settings["model_dir"]))
     selected_model_name = selected_model_dir.name
 
     with st.sidebar:
         # The app uses a pre-downloaded local Gemma model from 05_Manufacutre/model/google__gemma-4-E2B-it.
-        # The hidden system instruction is defined in DEFAULT_GEMMA_SYSTEM_PROMPT and is not user-editable.
         st.divider()
         st.subheader(selected_model_name)
         st.caption(
@@ -1292,16 +1188,22 @@ def render_sidebar_llm_panel(current_page_title: str | None = None) -> None:
         dependency_ready, dependency_message = are_runtime_dependencies_available()
         model_ready = is_model_downloaded(selected_model_dir)
 
-        prompt = st.text_area(
+        st.text_area(
             "Command",
             key="gemma_sidebar_prompt",
             height=140,
             placeholder="Enter the command or question to send to Gemma 4 E2B.",
         )
-        send_clicked = st.button("Send", key="gemma_sidebar_send", type="primary", width="stretch")
+        send_clicked = st.button(
+            "Send",
+            key="gemma_sidebar_send",
+            type="primary",
+            width="stretch",
+            on_click=_submit_sidebar_prompt,
+        )
 
         if send_clicked:
-            prompt_text = prompt.strip()
+            prompt_text = st.session_state.get("gemma_sidebar_pending_prompt", "").strip()
             if not prompt_text:
                 st.session_state["gemma_sidebar_status"] = "error"
                 st.session_state["gemma_sidebar_notice"] = "Please enter a question or command first."
@@ -1326,53 +1228,7 @@ def render_sidebar_llm_panel(current_page_title: str | None = None) -> None:
 
                 try:
                     with st.spinner("Running the LLM..."):
-                        runtime_context = _build_sidebar_runtime_context(current_page_title)
-                        app_route = route_app_command(
-                            user_prompt=prompt_text,
-                            current_page_title=current_page_title,
-                            runtime_context=runtime_context,
-                            model_dir=selected_model_dir,
-                            max_new_tokens=int(llm_settings["max_new_tokens"]),
-                            temperature=float(llm_settings["temperature"]),
-                            allow_llm=dependency_ready and model_ready,
-                        )
-
-                        if app_route is not None:
-                            tool_result = execute_app_mcp_tool(
-                                app_route["tool"],
-                                app_route.get("arguments", {}),
-                            )
-                            if tool_result.get("clear_dashboard_cache"):
-                                load_dashboard_data.clear()
-                                st.cache_data.clear()
-
-                            answer = app_route.get("assistant_message") or str(tool_result.get("message", ""))
-                            if tool_result.get("status") == "ok":
-                                st.session_state["gemma_sidebar_status"] = "completed"
-                                st.session_state["gemma_sidebar_notice"] = "The MCP app action has been applied."
-                                st.session_state["gemma_sidebar_response"] = answer
-                                _append_app_log(
-                                    log_type="done",
-                                    source="Sidebar MCP",
-                                    content=f"MCP tool `{tool_result.get('tool')}` completed.",
-                                    request=prompt_text,
-                                    response=answer,
-                                )
-                                target_page = str(tool_result.get("target_page") or "").strip()
-                                if target_page:
-                                    st.switch_page(target_page)
-                            else:
-                                st.session_state["gemma_sidebar_status"] = "error"
-                                st.session_state["gemma_sidebar_notice"] = "The MCP app action could not be applied."
-                                st.session_state["gemma_sidebar_response"] = answer
-                                _append_app_log(
-                                    log_type="error",
-                                    source="Sidebar MCP",
-                                    content=f"MCP tool `{tool_result.get('tool')}` failed.",
-                                    request=prompt_text,
-                                    response=answer,
-                                )
-                        elif not dependency_ready:
+                        if not dependency_ready:
                             st.session_state["gemma_sidebar_status"] = "error"
                             st.session_state["gemma_sidebar_notice"] = dependency_message
                             st.session_state["gemma_sidebar_response"] = ""
@@ -1385,7 +1241,7 @@ def render_sidebar_llm_panel(current_page_title: str | None = None) -> None:
                             )
                         elif not model_ready:
                             st.session_state["gemma_sidebar_status"] = "error"
-                            st.session_state["gemma_sidebar_notice"] = "The local model is not ready yet. Please place the model in the configured `model` folder first."
+                            st.session_state["gemma_sidebar_notice"] = "로컬 모델이 아직 준비되지 않았습니다. `model` 폴더에 모델을 먼저 배치해주세요."
                             st.session_state["gemma_sidebar_response"] = ""
                             _append_app_log(
                                 log_type="error",
@@ -1395,32 +1251,67 @@ def render_sidebar_llm_panel(current_page_title: str | None = None) -> None:
                                 response=st.session_state["gemma_sidebar_notice"],
                             )
                         else:
-                            augmented_prompt = (
-                                "[Current Streamlit Runtime Context]\n"
-                                f"{runtime_context}\n\n"
-                                "[User Request]\n"
-                                f"{prompt_text}\n\n"
-                                "Use the current Streamlit dashboard data and session state above as your primary context. "
-                                "Respond only in English. "
-                                "Do not guess about anything missing from the data; state clearly when information is unavailable."
-                            )
-                            answer = generate_response(
-                                prompt=augmented_prompt,
-                                system_prompt=DEFAULT_GEMMA_SYSTEM_PROMPT,
-                                max_new_tokens=int(llm_settings["max_new_tokens"]),
-                                temperature=float(llm_settings["temperature"]),
-                                model_dir=selected_model_dir,
-                            )
-                            st.session_state["gemma_sidebar_status"] = "completed"
-                            st.session_state["gemma_sidebar_notice"] = "The response has been generated."
-                            st.session_state["gemma_sidebar_response"] = answer
-                            _append_app_log(
-                                log_type="done",
-                                source="Sidebar LLM",
-                                content=f"Sidebar LLM response completed with model `{_to_project_relative_path(selected_model_dir)}`.",
-                                request=prompt_text,
-                                response=answer,
-                            )
+                            tool_result = handle_user_command(prompt_text)
+                            if tool_result.get("clear_dashboard_cache"):
+                                load_dashboard_data.clear()
+                                st.cache_data.clear()
+
+                            answer = str(tool_result.get("message", ""))
+                            status = tool_result.get("status")
+
+                            if status == "needs_input":
+                                st.session_state["gemma_sidebar_status"] = "completed"
+                                st.session_state["gemma_sidebar_notice"] = "추가 정보가 필요합니다. 이어서 답변을 입력해주세요."
+                                st.session_state["gemma_sidebar_response"] = answer
+                                _append_app_log(
+                                    log_type="start",
+                                    source="Sidebar Agent",
+                                    content="Agent asked a clarifying question.",
+                                    request=prompt_text,
+                                    response=answer,
+                                )
+                            elif status == "ok":
+                                st.session_state["gemma_sidebar_status"] = "completed"
+                                st.session_state["gemma_sidebar_notice"] = "요청하신 작업이 처리되었습니다."
+                                st.session_state["gemma_sidebar_response"] = answer
+                                _append_app_log(
+                                    log_type="done",
+                                    source="Sidebar Agent",
+                                    content=(
+                                        f"Tool `{tool_result.get('tool')}` completed with arguments "
+                                        f"{tool_result.get('invoked_args', {})}."
+                                    ),
+                                    request=prompt_text,
+                                    response=answer,
+                                )
+                                target_page = str(tool_result.get("target_page") or "").strip()
+                                if target_page:
+                                    st.switch_page(target_page)
+                            elif status == "unsupported":
+                                st.session_state["gemma_sidebar_status"] = "completed"
+                                st.session_state["gemma_sidebar_notice"] = "지원하지 않는 요청입니다."
+                                st.session_state["gemma_sidebar_response"] = answer
+                                _append_app_log(
+                                    log_type="done",
+                                    source="Sidebar Agent",
+                                    content="Agent found no matching tool for the request.",
+                                    request=prompt_text,
+                                    response=answer,
+                                )
+                            else:
+                                st.session_state["gemma_sidebar_status"] = "error"
+                                st.session_state["gemma_sidebar_notice"] = "요청 처리 중 오류가 발생했습니다."
+                                st.session_state["gemma_sidebar_response"] = answer
+                                _append_app_log(
+                                    log_type="error",
+                                    source="Sidebar Agent",
+                                    content=(
+                                        f"Tool `{tool_result.get('tool')}` failed with arguments "
+                                        f"{tool_result.get('invoked_args', {})}."
+                                    ),
+                                    request=prompt_text,
+                                    response=answer,
+                                )
                 except Exception as exc:
                     st.session_state["gemma_sidebar_status"] = "error"
                     st.session_state["gemma_sidebar_notice"] = "An error occurred while calling the LLM."
@@ -1492,6 +1383,133 @@ def build_aggregate_run(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
         "total_process_ms": sum(total_process_values),
     }
     return aggregate_run
+
+
+CLASSIFICATION_INFERENCE_CACHE_PATH = BASE_DIR / "outputs" / "classification" / "inference_cache.csv"
+
+
+def _read_classification_inference_cache() -> dict[str, str]:
+    """Read the persisted {project-relative image path: predicted label} cache, if any."""
+    if not CLASSIFICATION_INFERENCE_CACHE_PATH.exists():
+        return {}
+    try:
+        frame = pd.read_csv(CLASSIFICATION_INFERENCE_CACHE_PATH, dtype=str)
+    except Exception:
+        return {}
+    if "path" not in frame.columns or "label" not in frame.columns:
+        return {}
+    return {
+        str(row["path"]): str(row["label"])
+        for _, row in frame.iterrows()
+        if pd.notna(row["path"]) and pd.notna(row["label"])
+    }
+
+
+def _write_classification_inference_cache(cache: dict[str, str]) -> None:
+    CLASSIFICATION_INFERENCE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(sorted(cache.items()), columns=["path", "label"])
+    frame.to_csv(CLASSIFICATION_INFERENCE_CACHE_PATH, index=False)
+
+
+def _run_classification_inference_for_paths(
+    image_paths: list[str],
+) -> tuple[dict[str, str], int, int]:
+    """Classify `image_paths` with the default GPU(TensorRT)/CPU(ONNX) runtime.
+
+    Paths already present in CLASSIFICATION_INFERENCE_CACHE_PATH are reused as-is; only paths
+    missing from the cache are actually run through the model, and the cache is updated with any
+    newly computed labels so a later call over the same images does no model work at all.
+
+    Returns (label_by_path for every resolvable path in image_paths, cached_count, inferred_count).
+    """
+    from scripts.classifier_runtime import get_default_classifier_runtime
+    from PIL import Image
+
+    cache = _read_classification_inference_cache()
+    relative_paths = {path: _to_project_relative_path(path) for path in image_paths}
+    missing_paths = [path for path in image_paths if relative_paths[path] not in cache]
+
+    inferred_count = 0
+    if missing_paths:
+        runtime = get_default_classifier_runtime()
+        for path in missing_paths:
+            try:
+                with Image.open(path) as image:
+                    rgb_image = image.convert("RGB")
+                pixel_values = runtime.preprocess(rgb_image)
+                label = runtime.infer_label(pixel_values)
+            except Exception:
+                continue
+            cache[relative_paths[path]] = label
+            inferred_count += 1
+        _write_classification_inference_cache(cache)
+
+    label_by_path = {
+        path: cache[relative_paths[path]]
+        for path in image_paths
+        if relative_paths[path] in cache
+    }
+    cached_count = len(label_by_path) - inferred_count
+    return label_by_path, cached_count, inferred_count
+
+
+def _apply_inference_labels_to_records(
+    image_records: list[dict[str, Any]],
+    label_by_path: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Return a copy of image_records with `label`/`run_name` overridden from label_by_path."""
+    updated_records: list[dict[str, Any]] = []
+    for record in image_records:
+        predicted_label = label_by_path.get(record["path"])
+        if predicted_label is None:
+            updated_records.append(record)
+            continue
+        updated_record = dict(record)
+        updated_record["label"] = predicted_label
+        updated_record["run_name"] = predicted_label
+        updated_records.append(updated_record)
+    return updated_records
+
+
+def _build_runs_from_labeled_records(image_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Regroup image_records into the per-label "runs" structure load_dashboard_data produces,
+    so build_aggregate_run/build_label_distribution_frame keep working unchanged after labels
+    have been overridden (e.g. by a fresh classification inference pass)."""
+    grouped_counts: Counter[str] = Counter()
+    good_counts: Counter[str] = Counter()
+    bad_counts: Counter[str] = Counter()
+    latest_timestamps: dict[str, datetime] = {}
+
+    for record in image_records:
+        label = str(record["label"])
+        grouped_counts[label] += 1
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, datetime):
+            previous_timestamp = latest_timestamps.get(label)
+            if previous_timestamp is None or timestamp > previous_timestamp:
+                latest_timestamps[label] = timestamp
+        if label == "Normal":
+            good_counts[label] += 1
+        else:
+            bad_counts[label] += 1
+
+    now = datetime.now()
+    return [
+        {
+            "name": label,
+            "timestamp": latest_timestamps.get(label, now),
+            "path": "",
+            "total_count": count,
+            "label_counts": {label: count},
+            "good_count": int(good_counts.get(label, 0)),
+            "bad_count": int(bad_counts.get(label, 0)),
+            "model_dir": "",
+            "average_inference_ms": 0.0,
+            "total_process_ms": 0.0,
+        }
+        for label, count in sorted(grouped_counts.items())
+    ]
+
 
 def _extract_features_from_images(
     image_paths: list[str],

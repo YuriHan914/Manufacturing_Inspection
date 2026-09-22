@@ -31,7 +31,7 @@ AD_MEMORY_BANK_PATH = ROOT_DIR / "data" / "memory_bank" / "MB.npy"
 AD_HEATMAP_RANGE_PATH = ROOT_DIR / "data" / "memory_bank" / "heatmap_range.json"
 AD_OUTPUT_DIR = ROOT_DIR / "outputs" / "AD"
 
-from scripts.classification.classifier_runtime import get_default_classifier_runtime
+from scripts.classifier_runtime import get_default_classifier_runtime
 from scripts.detail_finetune_mcp import CLASSIFIER_MODEL_DIR, resolve_base_model_dir
 from scripts.utils import (
     CLASS_VISUALIZATION_ORDER,
