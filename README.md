@@ -40,7 +40,7 @@ cd Manufacturing_Inspection
 git lfs install
 git lfs pull
 
-
+#py3.12
 pip install -r requirements.txt
 ```
 
