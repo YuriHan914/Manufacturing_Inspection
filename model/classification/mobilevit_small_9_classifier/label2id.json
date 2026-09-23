@@ -1,0 +1,11 @@
+{
+  "Center": 0,
+  "Donut": 1,
+  "Edge-Loc": 2,
+  "Edge-Ring": 3,
+  "Local": 4,
+  "Near-Full": 5,
+  "Normal": 6,
+  "Random": 7,
+  "Scratch": 8
+}
