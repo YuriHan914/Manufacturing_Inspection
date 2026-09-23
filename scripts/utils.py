@@ -421,6 +421,9 @@ def _fetch_csv_fallback_rows(
     return rows
 
 
+SUPABASE_PAGE_SIZE = 1000  # PostgREST's own default max-rows-per-request; must page past it explicitly.
+
+
 def _fetch_supabase_semiconductor_rows(query_date_start: str | None = None, query_date_end: str | None = None) -> list[dict[str, Any]]:
     if SupabaseConnection is None:
         raise RuntimeError("The `st_supabase_connection` package could not be found.")
@@ -438,12 +441,7 @@ def _fetch_supabase_semiconductor_rows(query_date_start: str | None = None, quer
             date_start = None
             date_end = None
 
-    try:
-        query_builder = connection.query(
-            SUPABASE_IMAGE_COLUMNS,
-            table=SUPABASE_IMAGE_TABLE,
-            ttl=SUPABASE_QUERY_TTL,
-        )
+    def _apply_filters(query_builder: Any) -> Any:
         if hasattr(query_builder, "eq"):
             query_builder = query_builder.eq("trained", False)
         if date_start is not None and date_end is not None:
@@ -453,24 +451,39 @@ def _fetch_supabase_semiconductor_rows(query_date_start: str | None = None, quer
                 query_builder = query_builder.lt("create_date", date_end.isoformat())
         if hasattr(query_builder, "order"):
             query_builder = query_builder.order("create_date", desc=False)
-        result = query_builder.execute()
+        return query_builder
+
+    def _fetch_all_pages(build_query_builder: Any) -> list[Any]:
+        """PostgREST caps a single request at SUPABASE_PAGE_SIZE rows by default, so a table with
+        more rows than that would otherwise get silently truncated. Keep requesting successive
+        `.range()` pages until a short page (or a builder without `.range`) signals the end."""
+        all_rows: list[Any] = []
+        offset = 0
+        while True:
+            query_builder = _apply_filters(build_query_builder())
+            supports_range = hasattr(query_builder, "range")
+            if supports_range:
+                query_builder = query_builder.range(offset, offset + SUPABASE_PAGE_SIZE - 1)
+            result = query_builder.execute()
+            page_rows = list(getattr(result, "data", result) or [])
+            all_rows.extend(page_rows)
+            if not supports_range or len(page_rows) < SUPABASE_PAGE_SIZE:
+                break
+            offset += SUPABASE_PAGE_SIZE
+        return all_rows
+
+    try:
+        rows = _fetch_all_pages(
+            lambda: connection.query(SUPABASE_IMAGE_COLUMNS, table=SUPABASE_IMAGE_TABLE, ttl=SUPABASE_QUERY_TTL)
+        )
     except Exception as exc:
         last_error = exc
         client = getattr(connection, "client", None)
         if client is None:
             raise
 
-        query_builder = client.table(SUPABASE_IMAGE_TABLE).select(SUPABASE_IMAGE_COLUMNS).eq("trained", False)
-        if date_start is not None and date_end is not None:
-            if hasattr(query_builder, "gte"):
-                query_builder = query_builder.gte("create_date", date_start.isoformat())
-            if hasattr(query_builder, "lt"):
-                query_builder = query_builder.lt("create_date", date_end.isoformat())
-        if hasattr(query_builder, "order"):
-            query_builder = query_builder.order("create_date", desc=False)
-        result = query_builder.execute()
+        rows = _fetch_all_pages(lambda: client.table(SUPABASE_IMAGE_TABLE).select(SUPABASE_IMAGE_COLUMNS))
 
-    rows = getattr(result, "data", result)
     if not rows:
         return []
 
@@ -487,6 +500,60 @@ def _fetch_supabase_semiconductor_rows(query_date_start: str | None = None, quer
     if last_error is not None:
         print(f"Supabase query fallback applied after primary query failed: {last_error}")
     return normalized_rows
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_trained_image_records() -> list[dict[str, Any]]:
+    """Images already used in training (Supabase `trained=True`).
+
+    load_dashboard_data's own query filters on `trained=False` by design (it serves the pool of
+    untrained candidate images), so it never includes these — the Fine-tuning page's Active
+    Learning "Trained sample" group (re-sampling from already-trained data) needs this separate,
+    direct query instead.
+    """
+    if SupabaseConnection is None:
+        return []
+    try:
+        connection = st.connection(SUPABASE_CONNECTION_NAME, type=SupabaseConnection)
+        client = getattr(connection, "client", None)
+        if client is None:
+            return []
+
+        all_rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            result = (
+                client.table(SUPABASE_IMAGE_TABLE)
+                .select(SUPABASE_IMAGE_COLUMNS)
+                .eq("trained", True)
+                .range(offset, offset + SUPABASE_PAGE_SIZE - 1)
+                .execute()
+            )
+            rows = list(getattr(result, "data", result) or [])
+            all_rows.extend(rows)
+            if len(rows) < SUPABASE_PAGE_SIZE:
+                break
+            offset += SUPABASE_PAGE_SIZE
+    except Exception:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for row in all_rows:
+        raw_path = str(row.get("file_path") or "").strip()
+        if not raw_path:
+            continue
+        path_obj = Path(raw_path).expanduser()
+        records.append(
+            {
+                "path": str(path_obj),
+                "label": _normalize_db_label(row.get("class"), path_obj.parent.name),
+                "trained": True,
+                "dataset_type": str(row.get("type") or "").strip() or None,
+                "exists": path_obj.exists() and path_obj.is_file(),
+                "filename": path_obj.name,
+            }
+        )
+    return records
 
 
 def _load_supabase_image_candidates(
@@ -830,12 +897,14 @@ def _get_cached_detail_inference_result(
 
 @st.cache_resource(show_spinner=False)
 def _load_dashboard_classifier_runtime(model_dir_value: str) -> tuple[Any, str]:
-    """Default classifier runtime used to auto-label freshly discovered images.
+    """On-demand classifier runtime for explicit, non-automatic predictions (e.g. the Fine-tuning
+    page's Active Learning / margin sampling). Always serves the fixed GPU(TensorRT)/CPU(ONNX)
+    MobileViT export from scripts/classifier_runtime.py, regardless of `model_dir_value`; the
+    argument is kept only so the cache key stays attributable to the caller's model_dir.
 
-    Always serves the fixed GPU(TensorRT)/CPU(ONNX) MobileViT export from
-    scripts/classifier_runtime.py, regardless of `model_dir_value`; the argument is
-    kept only so the cache key/log messages stay attributable to `default_model_dir` the way the
-    rest of load_dashboard_data expects.
+    NOTE: load_dashboard_data does NOT call this automatically anymore (it previously ran
+    inference on every page load, which is slow and was removed by request) — it only reads
+    already-stored labels. This runtime is for features that explicitly ask for a prediction.
     """
     from scripts.classifier_runtime import get_default_classifier_runtime
 
@@ -957,29 +1026,6 @@ def load_dashboard_data(
         "query_date_end": effective_query_date_end or "all",
         "model_name": _to_project_relative_path(default_model_dir),
     }
-    prediction_warning: dict[str, str] | None = None
-    predicted_labels_by_path: dict[str, str] = {}
-    average_inference_ms = 0.0
-    total_process_ms = 0.0
-
-    if discovered_images:
-        image_paths = tuple(str(image_record["path"]) for image_record in discovered_images)
-        try:
-            predicted_labels_by_path, average_inference_ms, total_process_ms = _predict_dashboard_labels(
-                image_paths,
-                str(default_model_dir),
-            )
-        except Exception as exc:
-            prediction_warning = _build_log_entry(
-                log_type="Warning",
-                source="Inference",
-                content=(
-                    "Default classifier inference failed, so the stored label values were used instead. "
-                    f"model={_to_project_relative_path(default_model_dir)} | error={exc}"
-                ),
-                timestamp=now,
-            )
-
     predicted_run_counts: Counter[str] = Counter()
     predicted_good_counts: Counter[str] = Counter()
     predicted_bad_counts: Counter[str] = Counter()
@@ -989,15 +1035,12 @@ def load_dashboard_data(
         image_path = Path(candidate["path"])
         source_label = str(candidate["source_label"])
         database_predict = str(candidate.get("database_predict") or "").strip()
-        predicted_label = predicted_labels_by_path.get(str(image_path))
-        prediction_source = "default_model"
-        if not predicted_label:
-            if database_predict:
-                predicted_label = database_predict
-                prediction_source = "supabase_predict_fallback"
-            else:
-                predicted_label = source_label
-                prediction_source = "source_label_fallback"
+        if database_predict:
+            predicted_label = database_predict
+            prediction_source = "supabase_predict_fallback"
+        else:
+            predicted_label = source_label
+            prediction_source = "source_label_fallback"
 
         display_path = str(image_path)
         record_timestamp = candidate["timestamp"]
@@ -1033,7 +1076,6 @@ def load_dashboard_data(
         else:
             predicted_bad_counts[predicted_label] += 1
 
-    per_image_process_ms = (total_process_ms / len(discovered_images)) if discovered_images else 0.0
     for predicted_label in sorted(predicted_run_counts):
         image_count = int(predicted_run_counts[predicted_label])
         runs.append(
@@ -1046,8 +1088,8 @@ def load_dashboard_data(
                 "good_count": int(predicted_good_counts.get(predicted_label, 0)),
                 "bad_count": int(predicted_bad_counts.get(predicted_label, 0)),
                 "model_dir": str(default_model_dir),
-                "average_inference_ms": float(average_inference_ms),
-                "total_process_ms": float(per_image_process_ms * image_count),
+                "average_inference_ms": 0.0,
+                "total_process_ms": 0.0,
             }
         )
 
@@ -1056,15 +1098,13 @@ def load_dashboard_data(
 
     base_logs = [*_load_app_logs()]
     base_logs.extend(source_warning_logs)
-    if prediction_warning:
-        base_logs.append(prediction_warning)
     logs = _sort_log_entries(base_logs)
     print(
         "Loaded "
-        f"{len(runs)} predicted groups and {len(image_records)} images from {data_source} "
-        f"using {default_model_dir.name}."
+        f"{len(runs)} label groups and {len(image_records)} images from {data_source} "
+        "(stored labels, no automatic inference)."
     )
-   
+
     return config, runs, image_records, logs
 
 def build_label_distribution_frame(latest_run: dict[str, Any] | None) -> pd.DataFrame:
@@ -1386,10 +1426,124 @@ def build_aggregate_run(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 CLASSIFICATION_INFERENCE_CACHE_PATH = BASE_DIR / "outputs" / "classification" / "inference_cache.csv"
+CLASSIFIER_MODEL_FORMAT_LABELS = {"pytorch": "PyTorch", "tensorrt": "TensorRT", "onnx": "ONNX"}
 
 
-def _read_classification_inference_cache() -> dict[str, str]:
-    """Read the persisted {project-relative image path: predicted label} cache, if any."""
+def _classifier_model_id(model_format: str, model_path: Path) -> str:
+    return f"{model_format}:{_to_project_relative_path(model_path)}"
+
+
+def _legacy_classification_inference_model_id() -> str:
+    """Model id attributed to cache rows written before per-model caching existed — they all came
+    from the original fixed TensorRT/ONNX default export (see scripts/classifier_runtime.py)."""
+    from scripts.classifier_runtime import ENGINE_PATH
+
+    return _classifier_model_id("tensorrt", ENGINE_PATH)
+
+
+def _list_available_classification_inference_models() -> list[dict[str, Any]]:
+    """Every classification model selectable for Classification Inference, across the three export
+    formats this project produces: PyTorch checkpoint dirs, and the TensorRT/ONNX exports built by
+    scripts/classification/*.py (see jax_transform_onnx.py, convert_onnx_to_tensorrt.py)."""
+    if not CLASSIFICATION_MODEL_ROOT.exists():
+        return []
+
+    options: list[dict[str, Any]] = []
+    for path in sorted(CLASSIFICATION_MODEL_ROOT.iterdir(), key=lambda p: p.name):
+        if path.is_dir() and _is_valid_classifier_model_dir(path):
+            model_format = "pytorch"
+        elif path.is_file() and path.suffix == ".onnx":
+            model_format = "onnx"
+        elif path.is_file() and path.suffix == ".engine":
+            model_format = "tensorrt"
+        else:
+            continue
+        options.append(
+            {
+                "path": path,
+                "format": model_format,
+                "name": path.name,
+                "model_id": _classifier_model_id(model_format, path),
+            }
+        )
+    return options
+
+
+def _render_classification_inference_model_selector(container: Any = st) -> dict[str, Any] | None:
+    options = _list_available_classification_inference_models()
+    if not options:
+        container.warning(f"No classification models found under {_to_project_relative_path(CLASSIFICATION_MODEL_ROOT)}")
+        return None
+
+    option_by_id = {option["model_id"]: option for option in options}
+    available_ids = list(option_by_id.keys())
+
+    default_id = next((mid for mid in available_ids if option_by_id[mid]["format"] == "tensorrt"), available_ids[0])
+    if st.session_state.get("summary_inference_model_id") not in available_ids:
+        st.session_state["summary_inference_model_id"] = default_id
+
+    selected_id = container.selectbox(
+        "Inference model",
+        available_ids,
+        format_func=lambda mid: f"{option_by_id[mid]['name']} ({CLASSIFIER_MODEL_FORMAT_LABELS[option_by_id[mid]['format']]})",
+        key="summary_inference_model_id",
+    )
+    return option_by_id[selected_id]
+
+
+class _TorchClassifierHandle:
+    """Adapts a plain AutoModelForImageClassification + AutoImageProcessor pair to the same
+    preprocess()/infer_label() interface as scripts.classifier_runtime's TensorRT/ONNX runtimes, so
+    callers can treat all three classification-model formats identically."""
+
+    def __init__(self, image_processor: Any, model: Any, device: str) -> None:
+        import torch
+
+        self._torch = torch
+        self.processor = image_processor
+        self.model = model
+        self.device = device
+
+    def preprocess(self, image: Any) -> Any:
+        inputs = self.processor(images=image, return_tensors="pt")
+        return {key: value.to(self.device) for key, value in inputs.items()}
+
+    def infer_label(self, inputs: Any) -> str:
+        with self._torch.no_grad():
+            logits = self.model(**inputs).logits
+        predicted_index = int(logits.argmax(dim=-1).item())
+        return str(self.model.config.id2label[predicted_index])
+
+
+@st.cache_resource(show_spinner=False)
+def _load_torch_classifier_handle(model_dir_value: str) -> _TorchClassifierHandle:
+    import torch
+
+    _suppress_transformers_path_alias_warning()
+    from transformers import AutoImageProcessor, AutoModelForImageClassification
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    image_processor = AutoImageProcessor.from_pretrained(model_dir_value)
+    model = AutoModelForImageClassification.from_pretrained(model_dir_value).to(device)
+    model.eval()
+    return _TorchClassifierHandle(image_processor, model, device)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_forced_backend_classifier_runtime(model_format: str, model_path_value: str) -> Any:
+    from scripts.classifier_runtime import DefaultClassifierRuntime
+
+    return DefaultClassifierRuntime(backend=model_format, model_path=Path(model_path_value))
+
+
+def _load_classification_inference_runtime(model_option: dict[str, Any]) -> Any:
+    if model_option["format"] == "pytorch":
+        return _load_torch_classifier_handle(str(model_option["path"]))
+    return _load_forced_backend_classifier_runtime(model_option["format"], str(model_option["path"]))
+
+
+def _read_classification_inference_cache() -> dict[tuple[str, str], str]:
+    """Read the persisted {(model_id, project-relative image path): predicted label} cache, if any."""
     if not CLASSIFICATION_INFERENCE_CACHE_PATH.exists():
         return {}
     try:
@@ -1398,40 +1552,57 @@ def _read_classification_inference_cache() -> dict[str, str]:
         return {}
     if "path" not in frame.columns or "label" not in frame.columns:
         return {}
-    return {
-        str(row["path"]): str(row["label"])
-        for _, row in frame.iterrows()
-        if pd.notna(row["path"]) and pd.notna(row["label"])
-    }
+
+    has_model_id_column = "model_id" in frame.columns
+    legacy_model_id = _legacy_classification_inference_model_id()
+    cache: dict[tuple[str, str], str] = {}
+    for _, row in frame.iterrows():
+        if pd.isna(row["path"]) or pd.isna(row["label"]):
+            continue
+        raw_model_id = row.get("model_id") if has_model_id_column else None
+        model_id = str(raw_model_id) if pd.notna(raw_model_id) and str(raw_model_id).strip() else legacy_model_id
+        cache[(model_id, str(row["path"]))] = str(row["label"])
+    return cache
 
 
-def _write_classification_inference_cache(cache: dict[str, str]) -> None:
+def _write_classification_inference_cache(cache: dict[tuple[str, str], str]) -> None:
     CLASSIFICATION_INFERENCE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    frame = pd.DataFrame(sorted(cache.items()), columns=["path", "label"])
+    rows = sorted((model_id, path, label) for (model_id, path), label in cache.items())
+    frame = pd.DataFrame(rows, columns=["model_id", "path", "label"])
     frame.to_csv(CLASSIFICATION_INFERENCE_CACHE_PATH, index=False)
 
 
 def _run_classification_inference_for_paths(
     image_paths: list[str],
+    model_option: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], int, int]:
-    """Classify `image_paths` with the default GPU(TensorRT)/CPU(ONNX) runtime.
+    """Classify `image_paths` with `model_option` (from
+    _render_classification_inference_model_selector), or the default GPU(TensorRT)/CPU(ONNX)
+    runtime if no option is given.
 
-    Paths already present in CLASSIFICATION_INFERENCE_CACHE_PATH are reused as-is; only paths
-    missing from the cache are actually run through the model, and the cache is updated with any
-    newly computed labels so a later call over the same images does no model work at all.
+    Paths already present in CLASSIFICATION_INFERENCE_CACHE_PATH for this model are reused as-is;
+    only paths missing from the cache are actually run through the model, and the cache is updated
+    with any newly computed labels so a later call over the same images/model does no model work at
+    all. Switching models does not reuse another model's cached labels.
 
     Returns (label_by_path for every resolvable path in image_paths, cached_count, inferred_count).
     """
-    from scripts.classifier_runtime import get_default_classifier_runtime
     from PIL import Image
+
+    model_id = model_option["model_id"] if model_option else _legacy_classification_inference_model_id()
 
     cache = _read_classification_inference_cache()
     relative_paths = {path: _to_project_relative_path(path) for path in image_paths}
-    missing_paths = [path for path in image_paths if relative_paths[path] not in cache]
+    missing_paths = [path for path in image_paths if (model_id, relative_paths[path]) not in cache]
 
     inferred_count = 0
     if missing_paths:
-        runtime = get_default_classifier_runtime()
+        if model_option is None:
+            from scripts.classifier_runtime import get_default_classifier_runtime
+
+            runtime = get_default_classifier_runtime()
+        else:
+            runtime = _load_classification_inference_runtime(model_option)
         for path in missing_paths:
             try:
                 with Image.open(path) as image:
@@ -1440,14 +1611,14 @@ def _run_classification_inference_for_paths(
                 label = runtime.infer_label(pixel_values)
             except Exception:
                 continue
-            cache[relative_paths[path]] = label
+            cache[(model_id, relative_paths[path])] = label
             inferred_count += 1
         _write_classification_inference_cache(cache)
 
     label_by_path = {
-        path: cache[relative_paths[path]]
+        path: cache[(model_id, relative_paths[path])]
         for path in image_paths
-        if relative_paths[path] in cache
+        if (model_id, relative_paths[path]) in cache
     }
     cached_count = len(label_by_path) - inferred_count
     return label_by_path, cached_count, inferred_count

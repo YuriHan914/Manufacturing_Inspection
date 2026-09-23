@@ -22,12 +22,11 @@ from scripts.local_gemma_model import unload_model
 CLASSIFICATION_MODEL_ROOT = PROJECT_ROOT / "model" / "classification"
 CLASSIFIER_MODEL_DIR = CLASSIFICATION_MODEL_ROOT / "mobilevit_small_9_classifier"
 INTERACTIVE_FINETUNE_SCRIPT = PROJECT_ROOT / "scripts" / "interactive_finetune.py"
-INTERACTIVE_OUTPUT_ROOT = PROJECT_ROOT / "model"
+INTERACTIVE_OUTPUT_ROOT = CLASSIFICATION_MODEL_ROOT
 DETAIL_FINETUNE_SYSTEM_PROMPT = """You are a fine-tuning coach for a semiconductor image classification model.
 Respond only in English.
 Your job is to organize how the user wants to retrain the selected images and propose a safe fine-tuning plan.
 You may suggest creating a new class.
-You may also suggest an image preprocessing method from this list: none, light_augmentation, medium_augmentation, heavy_augmentation, histogram_equalization, denoise.
 Output exactly one JSON object and nothing else.
 JSON schema:
 {
@@ -35,7 +34,6 @@ JSON schema:
   "target_label": "Center|Donut|Edge-Loc|Edge-Ring|Local|Near-Full|Normal|Scratch or null",
   "create_new_class": false,
   "new_class_name": "new class name or null",
-  "preprocessing_method": "none|light_augmentation|medium_augmentation|heavy_augmentation|histogram_equalization|denoise",
   "epochs": number between 1.0 and 5.0,
   "learning_rate": number between 0.000001 and 0.0001,
   "repeat_count": integer between 4 and 64,
@@ -48,14 +46,6 @@ Rules:
 - If a new class is needed and does not already exist, set create_new_class=true and write the class name in new_class_name.
 - When creating a new class, set target_label to null.
 - new_class_name must use only letters, numbers, and underscores, with no spaces.
-- Preprocessing methods:
-  * none: no preprocessing
-  * light_augmentation: light augmentation (rotation within about ±10 degrees, horizontal flip)
-  * medium_augmentation: medium augmentation (rotation within about ±20 degrees, flips, brightness ±10%)
-  * heavy_augmentation: heavy augmentation (rotation within about ±30 degrees, flips, brightness/contrast ±20%)
-  * histogram_equalization: histogram equalization for uneven brightness
-  * denoise: denoise for noisy images
-- If the image appears noisy, prefer denoise. If the image has mixed dark and bright regions, prefer histogram_equalization.
 - Keep epochs, learning_rate, and repeat_count conservative.
 - Never output explanatory text outside the JSON object."""
 
@@ -106,7 +96,6 @@ class DetailFineTunePlan:
     ready_to_train: bool
     create_new_class: bool = False
     new_class_name: str | None = None
-    preprocessing_method: str = "none"
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,7 +199,6 @@ def save_detail_comment_file(
             f"manual_target_class_input: {manual_target_class_input or '-'}",
             f"selected_class_option: {selected_class_option or '-'}",
             f"create_new_class: {plan.create_new_class}",
-            f"preprocessing_method: {plan.preprocessing_method}",
             f"epochs: {plan.epochs}",
             f"learning_rate: {plan.learning_rate}",
             f"repeat_count: {plan.repeat_count}",
@@ -327,7 +315,6 @@ def save_detail_audit_logs(
         "create_new_class": bool(plan.create_new_class),
         "manual_target_class_input": manual_target_class_input,
         "selected_class_option": selected_class_option,
-        "preprocessing_method": plan.preprocessing_method,
         "epochs": float(plan.epochs),
         "learning_rate": float(plan.learning_rate),
         "repeat_count": int(plan.repeat_count),
@@ -358,7 +345,6 @@ def save_detail_audit_logs(
         f"target_label: {audit_payload['target_label'] or '-'}",
         f"manual_target_class_input: {manual_target_class_input or '-'}",
         f"selected_class_option: {selected_class_option or '-'}",
-        f"preprocessing_method: {plan.preprocessing_method}",
         f"epochs: {plan.epochs}",
         f"learning_rate: {plan.learning_rate}",
         f"repeat_count: {plan.repeat_count}",
@@ -432,11 +418,6 @@ def parse_detail_finetune_plan(raw_text: str, available_classes: list[str]) -> D
     else:
         new_class_name = None
 
-    preprocessing_method = str(payload.get("preprocessing_method", "none")).strip().lower()
-    valid_methods = ["none", "light_augmentation", "medium_augmentation", "heavy_augmentation", "histogram_equalization", "denoise"]
-    if preprocessing_method not in valid_methods:
-        preprocessing_method = "none"
-
     reply = str(payload.get("assistant_reply", "")).strip()
     if not reply:
         reply = "Please explain the retraining plan again."
@@ -454,7 +435,6 @@ def parse_detail_finetune_plan(raw_text: str, available_classes: list[str]) -> D
         ready_to_train=ready_to_train,
         create_new_class=create_new_class,
         new_class_name=new_class_name,
-        preprocessing_method=preprocessing_method,
         notes=str(payload.get("notes", "")).strip(),
     )
 
@@ -651,8 +631,6 @@ def run_detail_finetune_plan(
             command.extend(["--target-label", str(plan.target_label)])
 
     command.extend([
-        "--preprocessing-method",
-        plan.preprocessing_method,
         "--predicted-label",
         str(selected_records[0].get("predicted_label") or selected_records[0]["label"]),
         "--epochs",
@@ -723,9 +701,13 @@ def run_detail_finetune_plan(
         assert output_path is not None
         if output_path.exists():
             try:
+                # These are pure side-car artifacts (comment/context/audit logs) never read back
+                # by the app, so they go under metadata/ instead of the model directory root.
+                metadata_path = output_path / "metadata"
+                metadata_path.mkdir(parents=True, exist_ok=True)
                 llm_comment_path = _to_project_relative_path(
                     save_detail_comment_file(
-                        output_dir=output_path,
+                        output_dir=metadata_path,
                         plan=plan,
                         selected_records=selected_records,
                         chat_history=chat_history,
@@ -734,10 +716,10 @@ def run_detail_finetune_plan(
                         selected_class_option=selected_class_option,
                     )
                 )
-                selected_images_path = _to_project_relative_path(save_selected_images_file(output_path, selected_records))
+                selected_images_path = _to_project_relative_path(save_selected_images_file(metadata_path, selected_records))
                 context_json_path = _to_project_relative_path(
                     save_detail_context_json(
-                        output_dir=output_path,
+                        output_dir=metadata_path,
                         plan=plan,
                         selected_records=selected_records,
                         chat_history=chat_history,
@@ -747,7 +729,7 @@ def run_detail_finetune_plan(
                     )
                 )
                 audit_json_path, audit_text_path = save_detail_audit_logs(
-                    output_dir=output_path,
+                    output_dir=metadata_path,
                     plan=plan,
                     selected_records=selected_records,
                     base_model_dir=resolved_base_model_dir,

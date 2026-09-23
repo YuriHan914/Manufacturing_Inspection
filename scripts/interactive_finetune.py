@@ -68,7 +68,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-label", type=str, required=False)
     parser.add_argument("--create-new-class", action="store_true", default=False)
     parser.add_argument("--new-class-name", type=str, required=False)
-    parser.add_argument("--preprocessing-method", type=str, default="none", required=False)
     parser.add_argument("--manual-target-class-input", type=str, default="", required=False)
     parser.add_argument("--selected-class-option", type=str, default="", required=False)
     parser.add_argument("--epochs", type=float, default=2.0)
@@ -91,6 +90,59 @@ def load_records_csv(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         return [{"path": row["path"], "label": row["label"]} for row in reader]
+
+
+SUPABASE_IMAGE_TABLE = "semiconductor"
+SUPABASE_PAGE_SIZE = 1000  # PostgREST's own default max-rows-per-request.
+
+
+def _load_supabase_credentials() -> tuple[str, str]:
+    import toml
+
+    secrets_path = BASE_DIR / ".streamlit" / "secrets.toml"
+    if not secrets_path.exists():
+        raise RuntimeError(f"Supabase secrets file not found: {secrets_path}")
+    connection_secrets = toml.load(secrets_path).get("connections", {}).get("supabase", {})
+    url = str(connection_secrets.get("SUPABASE_URL") or "").strip()
+    key = str(connection_secrets.get("SUPABASE_KEY") or "").strip()
+    if not url or not key:
+        raise RuntimeError("Supabase URL/key are not configured in .streamlit/secrets.toml.")
+    return url, key
+
+
+def load_records_from_supabase(dataset_type: str) -> list[dict[str, str]]:
+    """Load {path, label} records straight from Supabase's `semiconductor` table, filtered by its
+    `type` column (train/valid/test). Used for valid/test so evaluation doesn't depend on a local
+    valid_split.csv/test_split.csv file, whose location can move between model directory layouts —
+    Supabase's `type` column is the same fixed split for every fine-tuning round regardless."""
+    from supabase import create_client
+
+    url, key = _load_supabase_credentials()
+    client = create_client(url, key)
+
+    records: list[dict[str, str]] = []
+    offset = 0
+    while True:
+        result = (
+            client.table(SUPABASE_IMAGE_TABLE)
+            .select("file_path,class")
+            .eq("type", dataset_type)
+            .range(offset, offset + SUPABASE_PAGE_SIZE - 1)
+            .execute()
+        )
+        rows = result.data or []
+        for row in rows:
+            file_path = str(row.get("file_path") or "").strip()
+            label = str(row.get("class") or "").strip()
+            if file_path and label:
+                records.append({"path": file_path, "label": label})
+        if len(rows) < SUPABASE_PAGE_SIZE:
+            break
+        offset += SUPABASE_PAGE_SIZE
+
+    if not records:
+        raise RuntimeError(f"No Supabase rows found with type={dataset_type!r} in `{SUPABASE_IMAGE_TABLE}`.")
+    return records
 
 
 def load_selected_records_manifest(path: Path) -> list[dict[str, Any]]:
@@ -256,9 +308,30 @@ def main() -> None:
     config = build_interactive_config(args.base_model_dir, args)
     set_seed(int(config.get("seed", 42)))
 
-    base_train_records = [] if bool(args.incremental_only) else load_records_csv(args.base_model_dir / "train_split.csv")
-    valid_records = load_records_csv(args.base_model_dir / "valid_split.csv")
-    test_records = load_records_csv(args.base_model_dir / "test_split.csv")
+    # Train only on the newly selected (active-learning or manually-picked) records — the
+    # previous run's train_split.csv is never re-included, whether or not a new class is being
+    # added. valid/test are queried straight from Supabase's `type` column (the same fixed
+    # held-out split every round) instead of a local valid_split.csv/test_split.csv file, whose
+    # location can move between model directory layouts.
+    #
+    # The Fine-tuning page's Active Learning "New sample" pool draws specifically from the
+    # valid/test images, so a selected image can itself be a valid/test row — exclude every
+    # selected path from valid/test so this round never evaluates on data it just trained on.
+    base_train_records: list[dict[str, str]] = []
+    selected_paths_for_exclusion = {str(Path(record["path"])) for record in selected_records}
+    valid_records = [
+        record for record in load_records_from_supabase("valid")
+        if str(Path(record["path"])) not in selected_paths_for_exclusion
+    ]
+    test_records = [
+        record for record in load_records_from_supabase("test")
+        if str(Path(record["path"])) not in selected_paths_for_exclusion
+    ]
+    if not valid_records or not test_records:
+        raise ValueError(
+            "The valid/test split is empty after excluding this round's selected images — "
+            "lower the Active Learning New sample rate so valid/test still has data left."
+        )
     train_records = build_augmented_train_records(
         base_train_records=base_train_records,
         selected_records=selected_records,
@@ -268,6 +341,12 @@ def main() -> None:
     run_name = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = ensure_output_dir(args.output_root / run_name)
     print(f"OUTPUT_DIR={to_project_relative_path(output_dir)}")
+    # Everything besides the loadable model itself (model.safetensors/config.json/
+    # preprocessor_config.json) and the training-continuation inputs (label2id.json,
+    # dataset_config.json) goes under metadata/ instead of cluttering the model directory:
+    # checkpoints, trainer_state.json, metrics, the split CSV snapshots, and our own request/audit
+    # json files.
+    metadata_dir = output_dir / "metadata"
 
     image_processor = AutoImageProcessor.from_pretrained(args.base_model_dir)
     model = AutoModelForImageClassification.from_pretrained(
@@ -282,14 +361,14 @@ def main() -> None:
     train_dataset = FolderImageClassificationDataset(train_records, label2id)
     valid_dataset = FolderImageClassificationDataset(valid_records, label2id)
     test_dataset = FolderImageClassificationDataset(test_records, label2id)
-    collator = ImageClassificationCollator(image_processor, preprocessing_method=args.preprocessing_method)
+    collator = ImageClassificationCollator(image_processor)
     class_weights = compute_class_weights(train_records, label2id)
     train_batch_size = max(1, int(config["train_batch_size"]))
     steps_per_epoch = math.ceil(len(train_dataset) / train_batch_size)
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"TRAIN_DEVICE={device_name}")
-    print(f"TRAIN_MODE={'incremental_only' if args.incremental_only else 'base_plus_selected'}")
+    print("TRAIN_MODE=selected_only")
     print(f"TRAIN_DATASET_SIZE={len(train_dataset)}")
     print(f"VALID_DATASET_SIZE={len(valid_dataset)}")
     print(f"TEST_DATASET_SIZE={len(test_dataset)}")
@@ -298,7 +377,7 @@ def main() -> None:
     if device_name == "cpu":
         print("WARNING: CUDA is not available, so training will run on CPU. This may take a while.")
 
-    training_args = build_training_arguments(config, output_dir)
+    training_args = build_training_arguments(config, metadata_dir, len(train_dataset))
     trainer = build_trainer(
         model=model,
         training_args=training_args,
@@ -322,15 +401,20 @@ def main() -> None:
         config=config,
         config_path=args.base_model_dir / "dataset_config.json",
     )
-    replace_training_args_bin_with_json(output_dir, training_args_payload)
+    replace_training_args_bin_with_json(metadata_dir, training_args_payload)
 
-    save_records_csv(train_records, output_dir / "train_split.csv")
-    save_records_csv(valid_records, output_dir / "valid_split.csv")
-    save_records_csv(test_records, output_dir / "test_split.csv")
+    # label2id.json/dataset_config.json are read back directly by the next incremental
+    # fine-tuning round (build_label_mappings/build_interactive_config above), so they stay in
+    # the model directory root; the split CSVs are now pure audit snapshots (train is always the
+    # freshly selected data, valid/test come from Supabase), so they go under metadata/.
+    save_records_csv(train_records, metadata_dir / "train_split.csv")
+    save_records_csv(valid_records, metadata_dir / "valid_split.csv")
+    save_records_csv(test_records, metadata_dir / "test_split.csv")
     save_json(label2id, output_dir / "label2id.json")
     save_json(config, output_dir / "dataset_config.json")
-    save_json(train_result.metrics, output_dir / "train_summary.json")
-    save_json(training_args_payload, output_dir / "training_args.json")
+
+    save_json(train_result.metrics, metadata_dir / "train_summary.json")
+    save_json(training_args_payload, metadata_dir / "training_args.json")
     save_json(
         {
             "selected_images": [to_project_relative_path(path) for path in selected_images],
@@ -347,7 +431,6 @@ def main() -> None:
             "create_new_class": args.create_new_class,
             "new_class_name": args.new_class_name,
             "added_selected_labels": added_selected_labels,
-            "preprocessing_method": args.preprocessing_method,
             "epochs": args.epochs,
             "learning_rate": args.learning_rate,
             "repeat_count": args.repeat_count,
@@ -357,7 +440,7 @@ def main() -> None:
             "selected_class_option": args.selected_class_option or None,
             "saved_model_dir": to_project_relative_path(output_dir),
         },
-        output_dir / "interactive_request.json",
+        metadata_dir / "interactive_request.json",
     )
 
     valid_metrics = trainer.evaluate(valid_dataset)
@@ -366,7 +449,7 @@ def main() -> None:
         trainer=trainer,
         dataset=valid_dataset,
         id2label=id2label,
-        output_dir=output_dir,
+        output_dir=metadata_dir,
         split_name="valid",
     )
 
@@ -376,7 +459,7 @@ def main() -> None:
         trainer=trainer,
         dataset=test_dataset,
         id2label=id2label,
-        output_dir=output_dir,
+        output_dir=metadata_dir,
         split_name="test",
         save_report=True,
     )
@@ -387,7 +470,7 @@ def main() -> None:
             "valid_metrics": valid_metrics,
             "test_metrics": test_metrics,
         },
-        output_dir / "all_results.json",
+        metadata_dir / "all_results.json",
     )
     print("Interactive fine-tuning completed successfully.")
 

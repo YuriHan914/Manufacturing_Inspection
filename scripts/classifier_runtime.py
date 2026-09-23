@@ -19,10 +19,10 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 ROOT_DIR = HERE.parent
 MODEL_DIR = ROOT_DIR / "model" / "classification"
-
-ENGINE_PATH = MODEL_DIR / "mobilevit_jax_engine_intro.engine"
-ONNX_PATH = MODEL_DIR / "mobilevit_jax_model.onnx"
 PROCESSOR_DIR = MODEL_DIR / "mobilevit_small_9_classifier"
+
+ENGINE_PATH = PROCESSOR_DIR / "mobilevit_jax_engine_intro.engine"
+ONNX_PATH = PROCESSOR_DIR / "mobilevit_jax_model.onnx"
 
 
 def _suppress_transformers_path_alias_warning() -> None:
@@ -119,9 +119,13 @@ class _OnnxClassifier:
 
 class DefaultClassifierRuntime:
     """Default classifier: TensorRT engine on GPU, ONNX Runtime CPU fallback when no GPU is present
-    (or if engine initialization fails for any reason)."""
+    (or if engine initialization fails for any reason).
 
-    def __init__(self) -> None:
+    `backend`/`model_path` let a caller force a specific backend and export file instead of the
+    auto-detect/fallback behavior above (used by the Classification Inference model picker in
+    scripts/utils.py to run a user-selected TensorRT or ONNX export rather than the fixed default)."""
+
+    def __init__(self, backend: str | None = None, model_path: Path | None = None) -> None:
         _suppress_transformers_path_alias_warning()
         from transformers import AutoImageProcessor
 
@@ -129,16 +133,18 @@ class DefaultClassifierRuntime:
         self.id2label = _load_id2label()
         self._lock = threading.Lock()
 
-        if gpu_available():
+        if backend in (None, "tensorrt") and (backend == "tensorrt" or gpu_available()):
             try:
-                self._classifier = _TensorRTClassifier()
+                self._classifier = _TensorRTClassifier(model_path or ENGINE_PATH)
                 self.backend = "tensorrt"
                 self.device = "cuda"
                 return
             except Exception:
-                pass  # fall through to the CPU ONNX backend below
+                if backend == "tensorrt":
+                    raise  # explicitly requested TensorRT, so don't silently swap backends
+                pass  # auto mode: fall through to the CPU ONNX backend below
 
-        self._classifier = _OnnxClassifier()
+        self._classifier = _OnnxClassifier(model_path or ONNX_PATH)
         self.backend = "onnx"
         self.device = "cpu"
 

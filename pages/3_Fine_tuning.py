@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import math
 import random
+import subprocess
 import sys
 from collections import Counter
 from io import BytesIO
@@ -34,6 +35,7 @@ from scripts.utils import (
     _to_project_relative_path,
     configure_page,
     load_dashboard_data,
+    load_trained_image_records,
     read_json_file,
     render_page_header,
 )
@@ -101,7 +103,7 @@ def _set_fine_tuning_selection_metadata(
     strategy: str,
     origin: str,
     notice: str = "",
-    selection_percentage: int | None = None,
+    selection_percentage: int | str | None = None,
     model_dir: Path | str | None = None,
 ) -> None:
     st.session_state["fine_tuning_selection_strategy"] = strategy.strip() or "Manual Selection"
@@ -425,6 +427,76 @@ def _get_detail_manual_setting_defaults(base_model_dir: Path) -> dict[str, Any]:
     }
 
 
+def _run_optimize_model_subprocess(model_dir: Path, status: Any) -> dict[str, Any]:
+    """Runs scripts/classification/optimize_model.py as a subprocess (the same pattern
+    Start fine-tuning already uses) instead of in-process.
+
+    In-process, a GPU OOM or native crash inside torch/TensorRT during the build can kill the
+    whole Streamlit server thread with no Python exception to catch — the progress window just
+    vanishes with nothing logged. As a subprocess, that same crash only kills the child process;
+    it exits with a non-zero (often negative/signal) return code, which is caught and reported
+    here instead of disappearing.
+    """
+    optimize_script = ROOT_DIR / "scripts" / "classification" / "optimize_model.py"
+    command = [sys.executable, "-u", str(optimize_script), "--model-dir", str(model_dir)]
+    process = subprocess.Popen(
+        command,
+        cwd=str(ROOT_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    output_lines: list[str] = []
+    buffer = ""
+    while True:
+        char = process.stdout.read(1)
+        if char == "" and process.poll() is not None:
+            break
+        if char in ("\r", "\n"):
+            cleaned = buffer.strip()
+            if cleaned:
+                status.write(cleaned)
+                output_lines.append(cleaned)
+            buffer = ""
+        else:
+            buffer += char
+    if buffer.strip():
+        status.write(buffer.strip())
+        output_lines.append(buffer.strip())
+
+    returncode = process.poll()
+    if returncode != 0:
+        tail = "\n".join(output_lines[-20:])
+        raise RuntimeError(
+            f"optimize_model.py exited with code {returncode} "
+            f"(a negative code means it was killed, e.g. out of GPU memory).\n{tail}"
+        )
+
+    onnx_path: str | None = None
+    engine_path: str | None = None
+    engine_error: str | None = None
+    for line in output_lines:
+        if line.startswith("ONNX_PATH="):
+            onnx_path = line.split("=", 1)[1].strip()
+        elif line.startswith("ENGINE_PATH="):
+            engine_path = line.split("=", 1)[1].strip()
+        elif line.startswith("ENGINE_ERROR="):
+            engine_error = line.split("=", 1)[1].strip()
+
+    if not onnx_path:
+        raise RuntimeError("optimize_model.py finished without reporting an ONNX_PATH.")
+
+    return {
+        "output_dir": str(model_dir),
+        "onnx_path": onnx_path,
+        "engine_path": engine_path,
+        "engine_error": engine_error,
+        "log": output_lines,
+    }
+
+
 def _render_fine_tuning_training_panel(
     image_pool_records: list[dict[str, Any]],
     selected_records: list[dict[str, Any]],
@@ -494,77 +566,105 @@ def _render_fine_tuning_training_panel(
 
     panel.divider()
     panel.write("Active Learning")
-    panel.caption("Automatically selects images for training based on the chosen inference model using the available sampling strategy.")
+    panel.caption(
+        "Samples two independent groups with the same strategy: **Trained sample** re-selects "
+        "from images already used in training (`trained=True`), and **New sample** draws from "
+        "the held-out valid/test pool (never used in training). Both groups are trained together."
+    )
     active_learning_notice = str(st.session_state.get(f"{state_prefix}_active_learning_notice", "")).strip()
     if active_learning_notice:
         panel.caption(active_learning_notice)
 
-    strategy_col, slider_col = panel.columns([0.9, 1.1], gap="large")
+    # load_dashboard_data's own query filters on trained=False (it serves the untrained candidate
+    # pool), so already-trained images are queried separately here rather than filtered out of
+    # image_pool_records (which never contains any).
+    trained_pool_records = load_trained_image_records()
+    new_pool_records = [
+        record
+        for record in image_pool_records
+        if str(record.get("dataset_type") or "").strip().lower() in {"valid", "test"}
+    ]
+
+    strategy_col, trained_slider_col, new_slider_col = panel.columns([0.8, 1.1, 1.1], gap="large")
     active_learning_strategy = strategy_col.selectbox(
         "Selection strategy",
         options=["Margin Sampling", "Random"],
         key=f"{state_prefix}_active_learning_strategy",
     )
-    selection_percentage = slider_col.slider(
-        "Selection rate (%)",
-        min_value=1,
+    trained_sample_percentage = trained_slider_col.slider(
+        f"Trained sample (%) — pool: {len(trained_pool_records)}",
+        min_value=0,
         max_value=100,
-        value=int(st.session_state.get(f"{state_prefix}_active_learning_percentage", 10)),
+        value=int(st.session_state.get(f"{state_prefix}_active_learning_trained_percentage", 10)),
         step=1,
-        key=f"{state_prefix}_active_learning_percentage",
+        key=f"{state_prefix}_active_learning_trained_percentage",
+    )
+    new_sample_percentage = new_slider_col.slider(
+        f"New sample (%) — pool: {len(new_pool_records)}",
+        min_value=0,
+        max_value=100,
+        value=int(st.session_state.get(f"{state_prefix}_active_learning_new_percentage", 10)),
+        step=1,
+        key=f"{state_prefix}_active_learning_new_percentage",
     )
 
-    selectable_records = [record for record in image_pool_records if record.get("exists")]
+    def _sample_pool(pool_records: list[dict[str, Any]], percentage: int) -> list[str]:
+        pool_selectable = [record for record in pool_records if record.get("exists")]
+        if percentage <= 0 or not pool_selectable:
+            return []
+        if active_learning_strategy == "Margin Sampling":
+            paths, _margin_frame = _select_margin_sampling_paths_for_fine_tuning(
+                image_pool_records=pool_selectable,
+                base_model_dir=base_model_dir,
+                selection_percentage=percentage,
+            )
+            return paths
+        sample_count = min(math.ceil(len(pool_selectable) * (percentage / 100.0)), len(pool_selectable))
+        if sample_count <= 0:
+            return []
+        sampled_path_set = set(random.sample([record["path"] for record in pool_selectable], sample_count))
+        return [record["path"] for record in pool_selectable if record["path"] in sampled_path_set]
+
+    active_learning_disabled = (
+        (trained_sample_percentage <= 0 or not trained_pool_records)
+        and (new_sample_percentage <= 0 or not new_pool_records)
+    )
     if panel.button(
         "Start active learning",
         key=f"{state_prefix}_active_learning_start",
-        disabled=not selectable_records,
+        disabled=active_learning_disabled,
         width="stretch",
     ):
         try:
-            if active_learning_strategy == "Margin Sampling":
-                selected_paths, margin_frame = _select_margin_sampling_paths_for_fine_tuning(
-                    image_pool_records=selectable_records,
-                    base_model_dir=base_model_dir,
-                    selection_percentage=selection_percentage,
-                )
-                if not selected_paths:
-                    panel.warning("No images were selected by margin sampling.")
-                else:
-                    min_margin = float(margin_frame["margin_score"].min()) if not margin_frame.empty else 0.0
-                    selection_notice = (
-                        f"Margin Sampling selected {len(selected_paths)} images. "
-                        f"Minimum margin={min_margin:.4f}"
-                    )
-                    _reset_fine_tuning_page_session(selected_paths)
-                    st.session_state[f"{state_prefix}_active_learning_percentage"] = selection_percentage
-                    st.session_state[f"{state_prefix}_active_learning_notice"] = selection_notice
-                    _set_fine_tuning_selection_metadata(
-                        selected_paths=selected_paths,
-                        strategy="Margin Sampling",
-                        origin="active_learning",
-                        notice=selection_notice,
-                        selection_percentage=selection_percentage,
-                        model_dir=base_model_dir,
-                    )
-                    st.rerun()
+            trained_selected_paths = _sample_pool(trained_pool_records, trained_sample_percentage)
+            new_selected_paths = _sample_pool(new_pool_records, new_sample_percentage)
+
+            combined_paths: list[str] = []
+            seen_paths: set[str] = set()
+            for path in (*trained_selected_paths, *new_selected_paths):
+                if path not in seen_paths:
+                    combined_paths.append(path)
+                    seen_paths.add(path)
+
+            if not combined_paths:
+                panel.warning(f"No images were selected by {active_learning_strategy}.")
             else:
-                sample_count = max(1, math.ceil(len(selectable_records) * (selection_percentage / 100.0)))
-                sample_count = min(sample_count, len(selectable_records))
-                sampled_paths = set(random.sample([record["path"] for record in selectable_records], sample_count))
-                selected_paths = [record["path"] for record in image_pool_records if record["path"] in sampled_paths]
-                selection_notice = f"Random sampling selected {len(selected_paths)} images."
-                _reset_fine_tuning_page_session(selected_paths)
-                st.session_state[f"{state_prefix}_active_learning_percentage"] = selection_percentage
+                selection_notice = (
+                    f"{active_learning_strategy} selected {len(combined_paths)} images "
+                    f"(trained sample: {len(trained_selected_paths)}, new sample: {len(new_selected_paths)})."
+                )
+                _reset_fine_tuning_page_session(combined_paths)
+                st.session_state[f"{state_prefix}_active_learning_trained_percentage"] = trained_sample_percentage
+                st.session_state[f"{state_prefix}_active_learning_new_percentage"] = new_sample_percentage
                 st.session_state[f"{state_prefix}_active_learning_notice"] = selection_notice
                 _set_fine_tuning_selection_metadata(
-                    selected_paths=selected_paths,
-                    strategy="Random",
+                    selected_paths=combined_paths,
+                    strategy=active_learning_strategy,
                     origin="active_learning",
                     notice=selection_notice,
-                    selection_percentage=selection_percentage,
-                        model_dir=base_model_dir,
-                    )
+                    selection_percentage=f"trained={trained_sample_percentage}%, new={new_sample_percentage}%",
+                    model_dir=base_model_dir,
+                )
                 st.rerun()
         except Exception as exc:
             panel.warning(f"An error occurred while running {active_learning_strategy}: {exc}")
@@ -796,6 +896,103 @@ def _render_fine_tuning_training_panel(
                     height=180,
                     disabled=True,
                 )
+
+        if execution_result["success"] and execution_result.get("output_dir"):
+            # Deliberately NOT prefixed with f"{state_prefix}_" ("fine_tuning_page_"):
+            # _reset_fine_tuning_page_session() wipes every session_state key with that prefix
+            # whenever the image-pool selection is judged to have changed (including spurious
+            # changes caused by the pool itself shrinking between reruns, e.g. right after
+            # fine-tuning marks images trained=True). That reset was firing on the very rerun
+            # this pending flag/result depend on, silently discarding them — which looked like
+            # "needs two clicks" or "the window just closes/vanishes mid-run."
+            optimize_state_key = "fine_tuning_optimize_result"
+            optimize_pending_key = "fine_tuning_optimize_pending"
+
+            if panel.button("Optimize Model", key=f"{state_prefix}_optimize_{widget_token}", width="stretch"):
+                # Don't run the (blocking, potentially long) subprocess inline in the very same
+                # script run as the click — that was requiring two clicks to actually start (the
+                # first click's run doesn't reliably see its own button state settle before
+                # heavy synchronous work follows). Instead: stash the target dir and force a
+                # fresh rerun; the actual work happens below, decoupled from the click itself.
+                st.session_state[optimize_pending_key] = str(execution_result["output_dir"])
+                st.rerun()
+
+            optimize_pending_output_dir = st.session_state.pop(optimize_pending_key, None)
+            if optimize_pending_output_dir:
+                log_lines: list[str] = []
+                # st.status() is a native progress window: it stays open and visibly updates
+                # (label + streamed lines) for the whole call, and switches to a clear
+                # complete/error state at the end — so a failure is never silent.
+                with panel.status("Optimizing model (ONNX + TensorRT)...", expanded=True) as status:
+                    try:
+                        fine_tuned_model_dir = ROOT_DIR / optimize_pending_output_dir
+                        status.write(f"Target model directory: {optimize_pending_output_dir}")
+                        status.write("Running as a subprocess (scripts/classification/optimize_model.py)...")
+
+                        optimize_result = _run_optimize_model_subprocess(fine_tuned_model_dir, status)
+                        log_lines = list(optimize_result["log"])
+                        if optimize_result["engine_error"]:
+                            status.update(label="ONNX saved, but the TensorRT build failed.", state="error", expanded=True)
+                        else:
+                            # Stays expanded even on success — a status box that auto-collapses
+                            # right when the button-triggered block finishes looks like the
+                            # window "just closed with nothing shown."
+                            status.update(label="Optimization complete.", state="complete", expanded=True)
+                        st.session_state[optimize_state_key] = {
+                            "success": True,
+                            "output_dir": _to_project_relative_path(optimize_result["output_dir"]),
+                            "onnx_path": _to_project_relative_path(optimize_result["onnx_path"]),
+                            "engine_path": (
+                                _to_project_relative_path(optimize_result["engine_path"])
+                                if optimize_result["engine_path"]
+                                else None
+                            ),
+                            "engine_error": optimize_result["engine_error"],
+                            "log": list(log_lines),
+                        }
+                        _append_app_log(
+                            log_type="done" if not optimize_result["engine_error"] else "Warning",
+                            source="Fine-tuning",
+                            content=(
+                                f"Optimized model (ONNX fp32 + TensorRT) saved to "
+                                f"`{_to_project_relative_path(optimize_result['output_dir'])}`."
+                                + (f" TensorRT build failed: {optimize_result['engine_error']}" if optimize_result["engine_error"] else "")
+                            ),
+                        )
+                    except Exception as exc:
+                        status.update(label="Optimization failed.", state="error", expanded=True)
+                        status.write(f"Error: {exc}")
+                        st.session_state[optimize_state_key] = {"success": False, "error": str(exc), "log": list(log_lines)}
+                        _append_app_log(
+                            log_type="error",
+                            source="Fine-tuning",
+                            content="Model optimization (ONNX/TensorRT export) failed.",
+                            response=str(exc),
+                        )
+
+            optimize_result_state = st.session_state.get(optimize_state_key)
+            if optimize_result_state:
+                # Always expanded: this is what's left visible on the next rerun after the
+                # button-triggered status window above disappears, so it must not also collapse.
+                with panel.expander("Optimize Model result", expanded=True):
+                    if optimize_result_state.get("success"):
+                        panel.success(f"Optimized model saved to `{optimize_result_state['output_dir']}`.")
+                        panel.caption(f"ONNX (fp32): {_format_display_path(optimize_result_state['onnx_path'])}")
+                        if optimize_result_state.get("engine_path"):
+                            panel.caption(f"TensorRT engine: {_format_display_path(optimize_result_state['engine_path'])}")
+                        else:
+                            panel.warning(f"TensorRT engine build failed (the ONNX export was still saved): {optimize_result_state.get('engine_error')}")
+                        panel.caption("The ONNX/TensorRT files are saved alongside the PyTorch model in the same folder.")
+                    else:
+                        panel.error(f"Model optimization failed: {optimize_result_state.get('error')}")
+                    if optimize_result_state.get("log"):
+                        panel.text_area(
+                            "Optimization log",
+                            value="\n".join(optimize_result_state["log"]),
+                            height=180,
+                            disabled=True,
+                            key=f"{state_prefix}_optimize_log_result_{widget_token}",
+                        )
 
 
 def render_fine_tuning_page(image_records) -> None:

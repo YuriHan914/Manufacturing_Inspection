@@ -3,6 +3,7 @@ import csv
 import inspect
 import json
 import logging
+import math
 import os
 from collections import Counter
 from pathlib import Path
@@ -70,19 +71,44 @@ DEFAULT_TRAINING_CONFIG = {
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
+def _resolve_record_image_path(record: dict[str, str]) -> Path:
+    image_path = Path(record["path"])
+    if not image_path.is_absolute():
+        image_path = (BASE_DIR / image_path).resolve()
+    return image_path
+
+
+def _filter_missing_image_records(
+    records: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[str]]:
+    kept_records = []
+    missing_paths = []
+    for record in records:
+        image_path = _resolve_record_image_path(record)
+        if image_path.is_file():
+            kept_records.append(record)
+        else:
+            missing_paths.append(str(image_path))
+    return kept_records, missing_paths
+
+
 class FolderImageClassificationDataset(Dataset):
     def __init__(self, records: list[dict[str, str]], label2id: dict[str, int]) -> None:
-        self.records = records
+        self.records, missing_paths = _filter_missing_image_records(records)
         self.label2id = label2id
+        if missing_paths:
+            print(f"WARNING: skipping {len(missing_paths)} record(s) with missing image files:")
+            for path in missing_paths[:10]:
+                print(f"  - {path}")
+            if len(missing_paths) > 10:
+                print(f"  ... and {len(missing_paths) - 10} more")
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
-        image_path = Path(record["path"])
-        if not image_path.is_absolute():
-            image_path = (BASE_DIR / image_path).resolve()
+        image_path = _resolve_record_image_path(record)
         with Image.open(image_path) as image:
             rgb_image = image.convert("RGB")
 
@@ -94,86 +120,11 @@ class FolderImageClassificationDataset(Dataset):
 
 
 class ImageClassificationCollator:
-    def __init__(self, image_processor: Any, preprocessing_method: str = "none") -> None:
+    def __init__(self, image_processor: Any) -> None:
         self.image_processor = image_processor
-        self.preprocessing_method = preprocessing_method
-
-    def _apply_preprocessing(self, image: Any) -> Any:
-        """Apply image preprocessing based on method."""
-        if self.preprocessing_method == "none":
-            return image
-        
-        import numpy as np
-        import cv2
-        from PIL import Image, ImageEnhance
-        
-        # Convert to PIL Image if needed
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray(image.astype("uint8"))
-        elif not isinstance(image, Image.Image):
-            image = Image.fromarray(np.array(image).astype("uint8"))
-        
-        image_array = np.array(image)
-        
-        if self.preprocessing_method == "light_augmentation":
-            # ±10° rotation, horizontal flip
-            if np.random.random() > 0.5:
-                image_array = np.fliplr(image_array).copy()
-            angle = np.random.uniform(-10, 10)
-            h, w = image_array.shape[:2]
-            matrix = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
-            image_array = cv2.warpAffine(image_array, matrix, (w, h), borderMode=cv2.BORDER_REFLECT)
-        
-        elif self.preprocessing_method == "medium_augmentation":
-            # ±20° rotation, horizontal flip, brightness ±10%
-            if np.random.random() > 0.5:
-                image_array = np.fliplr(image_array).copy()
-            angle = np.random.uniform(-20, 20)
-            h, w = image_array.shape[:2]
-            matrix = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
-            image_array = cv2.warpAffine(image_array, matrix, (w, h), borderMode=cv2.BORDER_REFLECT)
-            brightness_factor = np.random.uniform(0.9, 1.1)
-            image_array = np.clip(image_array.astype(float) * brightness_factor, 0, 255).astype(np.uint8)
-        
-        elif self.preprocessing_method == "heavy_augmentation":
-            # ±30° rotation, horizontal flip, brightness/contrast ±20%
-            if np.random.random() > 0.5:
-                image_array = np.fliplr(image_array).copy()
-            angle = np.random.uniform(-30, 30)
-            h, w = image_array.shape[:2]
-            matrix = cv2.getRotationMatrix2D((w/2, h/2), angle, 1.0)
-            image_array = cv2.warpAffine(image_array, matrix, (w, h), borderMode=cv2.BORDER_REFLECT)
-            brightness_factor = np.random.uniform(0.8, 1.2)
-            image_array = np.clip(image_array.astype(float) * brightness_factor, 0, 255).astype(np.uint8)
-            contrast_factor = np.random.uniform(0.8, 1.2)
-            mean = image_array.mean()
-            image_array = np.clip((image_array - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
-        
-        elif self.preprocessing_method == "histogram_equalization":
-            # Improve contrast for low contrast images
-            if len(image_array.shape) == 3:  # Color image
-                image_hsv = cv2.cvtColor(image_array, cv2.COLOR_RGB2HSV)
-                image_hsv[:, :, 2] = cv2.equalizeHist(image_hsv[:, :, 2])
-                image_array = cv2.cvtColor(image_hsv, cv2.COLOR_HSV2RGB)
-            else:  # Grayscale
-                image_array = cv2.equalizeHist(image_array)
-        
-        elif self.preprocessing_method == "denoise":
-            # Remove noise
-            if len(image_array.shape) == 3:  # Color image
-                image_array = cv2.fastNlMeansDenoisingColored(image_array, None, h=10, hForColorComponents=10, templateWindowSize=7, searchWindowSize=21)
-            else:  # Grayscale
-                image_array = cv2.fastNlMeansDenoising(image_array, None, h=10, templateWindowSize=7, searchWindowSize=21)
-        
-        return Image.fromarray(image_array.astype("uint8"))
 
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         images = [item["image"] for item in batch]
-        
-        # Apply preprocessing if specified
-        if self.preprocessing_method != "none":
-            images = [self._apply_preprocessing(img) for img in images]
-        
         labels = torch.tensor([item["labels"] for item in batch], dtype=torch.long)
         model_inputs = self.image_processor(images=images, return_tensors="pt")
         model_inputs["labels"] = labels
@@ -505,7 +456,7 @@ def compute_metrics(eval_pred: tuple[np.ndarray, np.ndarray]) -> dict[str, float
     }
 
 
-def build_training_arguments(config: dict[str, Any], output_dir: Path) -> TrainingArguments:
+def build_training_arguments(config: dict[str, Any], output_dir: Path, train_dataset_size: int) -> TrainingArguments:
     training_kwargs: dict[str, Any] = {
         "output_dir": str(output_dir),
         "remove_unused_columns": False,
@@ -515,7 +466,6 @@ def build_training_arguments(config: dict[str, Any], output_dir: Path) -> Traini
         "gradient_accumulation_steps": int(config["gradient_accumulation_steps"]),
         "num_train_epochs": float(config["num_epochs"]),
         "weight_decay": float(config["weight_decay"]),
-        "warmup_ratio": float(config["warmup_ratio"]),
         "logging_steps": int(config["logging_steps"]),
         "save_total_limit": int(config["save_total_limit"]),
         "seed": int(config["seed"]),
@@ -533,6 +483,17 @@ def build_training_arguments(config: dict[str, Any], output_dir: Path) -> Traini
     parameter_names = inspect.signature(TrainingArguments.__init__).parameters
     eval_key = "eval_strategy" if "eval_strategy" in parameter_names else "evaluation_strategy"
     training_kwargs[eval_key] = "epoch"
+
+    if "warmup_ratio" in parameter_names:
+        training_kwargs["warmup_ratio"] = float(config["warmup_ratio"])
+    else:
+        # transformers v5 dropped warmup_ratio from TrainingArguments; convert it to warmup_steps ourselves.
+        optimizer_steps_per_epoch = max(
+            1,
+            math.ceil(train_dataset_size / (int(config["train_batch_size"]) * int(config["gradient_accumulation_steps"]))),
+        )
+        total_optimizer_steps = max(1, math.ceil(optimizer_steps_per_epoch * float(config["num_epochs"])))
+        training_kwargs["warmup_steps"] = int(total_optimizer_steps * float(config["warmup_ratio"]))
 
     return TrainingArguments(**training_kwargs)
 
@@ -735,7 +696,7 @@ def main() -> None:
         class_weights = compute_class_weights(train_records, label2id)
         print(f"Using class weights: {class_weights.tolist()}")
 
-    training_args = build_training_arguments(config, args.output_dir)
+    training_args = build_training_arguments(config, args.output_dir, len(train_dataset))
     trainer = build_trainer(
         model=model,
         training_args=training_args,

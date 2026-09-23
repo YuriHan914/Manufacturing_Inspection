@@ -42,6 +42,7 @@ from scripts.utils import (
     _render_classifier_model_selector,
     _suppress_transformers_path_alias_warning,
     _to_project_relative_path,
+    _TorchClassifierHandle,
     configure_page,
     load_dashboard_data,
     render_page_header,
@@ -169,30 +170,6 @@ def _save_inference_timing(
             lines.append(f"{path}: {value:.3f}")
 
     output_timing_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-class _TorchClassifierHandle:
-    """Adapts an AutoModelForImageClassification model to the preprocess()/infer_label()
-    interface shared with the default TensorRT/ONNX runtime (see _load_detail_classifier_runtime),
-    so the reinference loop below doesn't need to special-case either backend."""
-
-    def __init__(self, image_processor: Any, model: Any, device: str) -> None:
-        import torch
-
-        self._torch = torch
-        self.processor = image_processor
-        self.model = model
-        self.device = device
-
-    def preprocess(self, image: Any) -> Any:
-        inputs = self.processor(images=image, return_tensors="pt")
-        return {key: value.to(self.device) for key, value in inputs.items()}
-
-    def infer_label(self, inputs: Any) -> str:
-        with self._torch.no_grad():
-            logits = self.model(**inputs).logits
-        predicted_index = int(logits.argmax(dim=-1).item())
-        return str(self.model.config.id2label[predicted_index])
 
 
 def _load_detail_torch_classifier_runtime(model_dir: Path) -> tuple[Any, Any, str, float]:

@@ -121,6 +121,36 @@ def unload_model() -> None:
         torch.cuda.empty_cache()
 
 
+def embed_text(text: str, model_dir: str | Path | None = None) -> list[float]:
+    """Return a last-token hidden-state embedding for `text` from the local Gemma model.
+
+    Used for cosine-similarity based tool/intent routing (see scripts.tool_router) — the same
+    local model produces both generation and embeddings, no separate embedding model is loaded.
+
+    Gemma is a causal (decoder-only) model, so only the LAST token's hidden state has
+    attended to the full sequence via self-attention; every earlier position only saw a
+    prefix. Mean-pooling across all positions would dilute the embedding with those
+    partial-context representations, so last-token pooling is used instead — the standard
+    approach for causal-LM embeddings (as in e.g. e5-mistral, LLM2Vec).
+    """
+    normalized = text.strip()
+    if not normalized:
+        return []
+
+    resolved_model_dir = _resolve_model_dir(model_dir)
+    torch, processor, model = load_model(str(resolved_model_dir))
+    tokenizer = getattr(processor, "tokenizer", processor)
+
+    inputs = tokenizer(normalized, return_tensors="pt", truncation=True, max_length=64).to(model.device)
+
+    with torch.inference_mode():
+        outputs = model(**inputs, output_hidden_states=True, use_cache=False)
+
+    last_hidden_state = outputs.hidden_states[-1][0]  # (seq_len, hidden_dim)
+    embedding = last_hidden_state[-1]  # hidden state of the final (fully-attended) token
+    return embedding.float().cpu().tolist()
+
+
 def _extract_response_text(processor: Any, output_tokens: Any, input_len: int) -> str:
     raw_text = processor.decode(output_tokens[0][input_len:], skip_special_tokens=False).strip()
 

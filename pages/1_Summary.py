@@ -31,6 +31,7 @@ from scripts.utils import (
     _get_discrete_class_colors,
     _get_llm_runtime_settings,
     _read_classification_inference_cache,
+    _render_classification_inference_model_selector,
     _run_classification_inference_for_paths,
     _to_project_relative_path,
     build_aggregate_run,
@@ -743,11 +744,17 @@ def render_classification_inference_section(
     period_caption = f"{query_date_start} ~ {query_date_end}" if query_date_start and query_date_end else "All dates"
 
     candidate_paths = [record["path"] for record in image_records if record.get("exists")]
-    cached_lookup = _read_classification_inference_cache()
-    pending_count = sum(1 for path in candidate_paths if _to_project_relative_path(path) not in cached_lookup)
 
     with st.container(border=True):
         st.subheader("Classification Inference")
+        model_option = _render_classification_inference_model_selector()
+        model_id = model_option["model_id"] if model_option else None
+
+        cached_lookup = _read_classification_inference_cache()
+        pending_count = sum(
+            1 for path in candidate_paths if (model_id, _to_project_relative_path(path)) not in cached_lookup
+        )
+
         st.caption(
             f"Query period: {period_caption} | {len(candidate_paths)} image(s) in range | "
             f"{pending_count} pending inference"
@@ -755,26 +762,26 @@ def render_classification_inference_section(
         run_clicked = st.button(
             "Run Inference",
             key="summary_run_inference_button",
-            disabled=not candidate_paths,
+            disabled=not candidate_paths or model_option is None,
         )
         if run_clicked:
             with st.spinner("Classifying this period's images..."):
                 label_by_path, cached_count, inferred_count = _run_classification_inference_for_paths(
-                    candidate_paths
+                    candidate_paths, model_option
                 )
             st.session_state["summary_inference_label_by_path"] = label_by_path
-            st.session_state["summary_inference_signature"] = (query_date_start, query_date_end)
+            st.session_state["summary_inference_signature"] = (query_date_start, query_date_end, model_id)
             st.success(f"Inference complete: {inferred_count} newly inferred, {cached_count} loaded from cache.")
 
-        if st.session_state.get("summary_inference_signature") == (query_date_start, query_date_end):
+        if st.session_state.get("summary_inference_signature") == (query_date_start, query_date_end, model_id):
             label_by_path = st.session_state.get("summary_inference_label_by_path", {})
         elif candidate_paths and pending_count == 0:
-            # Every image in this period is already in the on-disk cache from a previous run, so
-            # apply it without requiring another click.
+            # Every image in this period is already in the on-disk cache for this model from a
+            # previous run, so apply it without requiring another click.
             label_by_path = {
-                path: cached_lookup[_to_project_relative_path(path)]
+                path: cached_lookup[(model_id, _to_project_relative_path(path))]
                 for path in candidate_paths
-                if _to_project_relative_path(path) in cached_lookup
+                if (model_id, _to_project_relative_path(path)) in cached_lookup
             }
         else:
             label_by_path = {}
