@@ -8,7 +8,7 @@
 ## 📽 데모 영상
 
 <p align="center">
-  <a href="https://youtu.be/LEap37YUmlg">
+  <a href="https://youtu.be/ZHjwQyarjOs">
     <img src="assets/Analysis_AD.png" width="700"/>
   </a>
 </p>
