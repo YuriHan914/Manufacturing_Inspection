@@ -23,6 +23,11 @@ from scripts.detail_finetune_mcp import (
     resolve_base_model_dir,
     run_detail_finetune_plan,
 )
+from scripts.point_cloud_inference import (
+    POINT_CLOUD_MODEL_NAME,
+    load_point_cloud_results,
+    result_for_path,
+)
 from scripts.utils import (
     SUPABASE_CONNECTION_NAME,
     SUPABASE_IMAGE_TABLE,
@@ -995,7 +1000,70 @@ def _render_fine_tuning_training_panel(
                         )
 
 
+def render_point_cloud_fine_tuning_page(image_records: list[dict[str, Any]]) -> None:
+    """Fine-tuning page for the 3D point-cloud table. 3D-KD is the only inference model, and
+    training is disabled because no 3D training dataset exists yet."""
+    render_page_header(
+        "Fine-tuning",
+        f"3D point cloud data uses the {POINT_CLOUD_MODEL_NAME} anomaly detection model. "
+        "Fine-tuning is disabled until a 3D training dataset is available.",
+    )
+    if not image_records:
+        st.info("There is no point cloud pool available.")
+        return
+
+    saved_results = load_point_cloud_results()
+    left_col, right_col = st.columns([1, 1], gap="large")
+
+    with left_col:
+        with st.container(border=True):
+            st.subheader("Point Cloud Pool")
+            st.caption(
+                f"Predictions come from saved {POINT_CLOUD_MODEL_NAME} results in outputs/3D-AD. "
+                "Run inference on the Summary or Analysis page to fill in missing ones."
+            )
+            st.selectbox("Inference model", [POINT_CLOUD_MODEL_NAME], key="fine_tuning_point_cloud_model")
+            table_rows = []
+            for index, record in enumerate(image_records, start=1):
+                result = result_for_path(saved_results, record["path"])
+                table_rows.append(
+                    {
+                        "Index": index,
+                        "Filename": record["filename"],
+                        "Trained": bool(record.get("trained", False)),
+                        "Predicted Class": str(result["label"]) if result else "-",
+                        "Max Score": float(result["max_score"]) if result else None,
+                        "Select": False,
+                    }
+                )
+            st.data_editor(
+                pd.DataFrame(table_rows),
+                hide_index=True,
+                use_container_width=True,
+                disabled=True,
+                column_config={
+                    "Index": st.column_config.NumberColumn("Index", format="%d", width="small"),
+                    "Max Score": st.column_config.NumberColumn("Max Score", format="%.3f"),
+                    "Select": st.column_config.CheckboxColumn(
+                        "Select", help="Disabled: no 3D training dataset is available yet."
+                    ),
+                },
+                key="fine_tuning_point_cloud_pool_editor",
+            )
+
+    with right_col:
+        with st.container(border=True):
+            st.subheader("Interactive Fine-tuning")
+            st.info(
+                f"There is no training dataset for {POINT_CLOUD_MODEL_NAME} yet, so fine-tuning is disabled."
+            )
+            st.button("Start Fine-tuning", key="fine_tuning_point_cloud_start", width="stretch", disabled=True)
+
+
 def render_fine_tuning_page(image_records) -> None:
+    if any(str(record.get("data_source", "")).startswith("point_cloud") for record in image_records):
+        render_point_cloud_fine_tuning_page(image_records)
+        return
     render_page_header(
         "Fine-tuning",
         "Select training samples from the image pool, then run Interactive Fine-tuning. "
