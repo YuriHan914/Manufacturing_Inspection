@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v0.7.0] - 2026-10-01
+
+### Added
+
+* Added 3D point cloud anomaly detection with `3D-KD` (teacher–student knowledge distillation) — a new `3D Rubbish bin` table can be selected on the Dashboard page, and results are saved under `outputs/3D-AD`; files that already have saved results are loaded instead of being run again
+* Added 3D-KD inference to the Summary page: per-file prediction, max score, image threshold, and anomalous point ratio, plus a 3D view colored by anomaly score
+* Added a 3D point cloud mode to the Analysis page: select `.ply` files and click `Run` to see each file's results and a 3D view colored by per-point anomaly score
+* Added a 3D point cloud view to the Fine-tuning page that lists saved 3D-KD predictions (fine-tuning stays disabled until a 3D training dataset is available)
+
+---
+
 ## [v0.6.0] - 2026-09-22
 
 ### Changed

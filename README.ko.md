@@ -24,8 +24,9 @@
 
 * Streamlit 기반 검사 애플리케이션
 * MobileViT 이미지 분류 학습 및 추론
-* PatchCore 기반 이상 탐지(Anomaly Detection)
-* 액티브 러닝 기반 샘플링
+* PatchCore 기반 이상 탐지
+* 3D차원 포인트 클라우드 이상 탐지(3D Rubbish Bin)
+* Active Learning 기반 샘플링
 * 선택한 이미지를 이용한 인터랙티브 파인튜닝
 * Gemma 기반 어시스턴트 응답
 

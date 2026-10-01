@@ -25,6 +25,7 @@ A Streamlit-based application for semiconductor inspection, featuring image clas
 * Streamlit-based inspection Application
 * MobileViT image classification training and inference
 * PatchCore-based Anomaly Detection
+* 3D Point Cloud Anomaly Detection(3D Rubbish Bin)
 * Active Learning-based sampling
 * Interactive fine-tuning with selected images
 * Gemma-based assistant responses
