@@ -33,6 +33,14 @@ AD_OUTPUT_DIR = ROOT_DIR / "outputs" / "AD"
 
 from scripts.classifier_runtime import get_default_classifier_runtime
 from scripts.detail_finetune_mcp import CLASSIFIER_MODEL_DIR, resolve_base_model_dir
+from scripts.point_cloud_inference import (
+    POINT_CLOUD_MODEL_NAME,
+    build_point_cloud_score_figure,
+    load_point_cloud_results,
+    load_result_full_cloud,
+    result_for_path,
+    run_point_cloud_inference,
+)
 from scripts.utils import (
     CLASS_VISUALIZATION_ORDER,
     _append_app_log,
@@ -1584,8 +1592,165 @@ def _render_ad_xai_visualization(
     )
 
 
+def _is_point_cloud_records(image_records: list[dict[str, Any]]) -> bool:
+    return any(str(record.get("data_source", "")).startswith("point_cloud") for record in image_records)
+
+
+def _render_point_cloud_run_button(selected_records: list[dict[str, Any]]) -> None:
+    """Run 3D-KD on the selected point clouds. Files with a saved result in outputs/3D-AD are loaded
+    instead of re-inferred; the rest are inferred and saved there."""
+    selected_paths = [record["path"] for record in selected_records if record.get("exists")]
+    run_clicked = st.button("Run", key="detail_point_cloud_run_button", width="stretch", disabled=not selected_paths)
+    if not run_clicked:
+        return
+
+    saved_results = load_point_cloud_results()
+    pending_paths = [path for path in selected_paths if result_for_path(saved_results, path) is None]
+    if pending_paths:
+        normal_reference_paths = [
+            record["path"]
+            for record in st.session_state.get("_detail_point_cloud_all_records", [])
+            if record.get("source_label") == "Normal"
+        ]
+        try:
+            with st.spinner(f"Running {POINT_CLOUD_MODEL_NAME} on {len(pending_paths)} point cloud(s)..."):
+                run_point_cloud_inference(pending_paths, normal_reference_paths)
+        except Exception as exc:
+            st.error(f"{POINT_CLOUD_MODEL_NAME} inference failed: {exc}")
+            _append_app_log(
+                log_type="error",
+                source="Analysis",
+                content=f"{POINT_CLOUD_MODEL_NAME} inference failed for {len(pending_paths)} point cloud(s): {exc}",
+            )
+            return
+    _append_app_log(
+        log_type="done",
+        source="Analysis",
+        content=(
+            f"{POINT_CLOUD_MODEL_NAME} run on {len(selected_paths)} point cloud(s): "
+            f"{len(pending_paths)} newly inferred, {len(selected_paths) - len(pending_paths)} loaded from outputs/3D-AD."
+        ),
+    )
+    st.session_state["detail_point_cloud_run_signature"] = tuple(sorted(selected_paths))
+    st.rerun()
+
+
+def _render_point_cloud_result_tab(selected_records: list[dict[str, Any]]) -> None:
+    selected_paths = [record["path"] for record in selected_records if record.get("exists")]
+    if st.session_state.get("detail_point_cloud_run_signature") != tuple(sorted(selected_paths)):
+        st.info(f"Click **Run** to detect anomalies in the selected point clouds with {POINT_CLOUD_MODEL_NAME}.")
+        return
+
+    saved_results = load_point_cloud_results()
+    for record in selected_records:
+        result = result_for_path(saved_results, record["path"])
+        with st.container(border=True):
+            if result is None:
+                st.warning(f"{record['filename']}: no {POINT_CLOUD_MODEL_NAME} result found. Click **Run** again.")
+                continue
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Prediction", str(result["label"]))
+            metric_cols[1].metric("Max score", f"{float(result['max_score']):.3f}")
+            metric_cols[2].metric("Image threshold", f"{float(result['image_threshold']):.3f}")
+            metric_cols[3].metric("Anomalous points", f"{float(result['anomalous_point_ratio']):.2f}%")
+
+            full_cloud = load_result_full_cloud(result)
+            if full_cloud is None:
+                st.caption(
+                    "The saved full point cloud (_full.ply) for this file was not found. Re-run inference to regenerate it."
+                )
+                continue
+            points, scores = full_cloud
+            st.plotly_chart(
+                build_point_cloud_score_figure(
+                    points,
+                    scores,
+                    float(result["point_threshold"]),
+                    f"{result['name']}_full  (point threshold={float(result['point_threshold']):.3f})",
+                    max_points=None,
+                ),
+                width="stretch",
+                key=f"detail_point_cloud_plot_{result['name']}",
+            )
+
+
+def render_point_cloud_detail_page(image_records: list[dict[str, Any]]) -> None:
+    """Analysis page for the 3D point-cloud table: 3D-KD is the only method and only the Result tab
+    is active (3D Visualization / XAI are image-feature based and do not apply to point clouds)."""
+    st.session_state["_detail_point_cloud_all_records"] = image_records
+    all_dates = ["All dates"] + sorted({record["date"] for record in image_records}, reverse=True)
+    all_classes = ["All classes"] + sorted({record["label"] for record in image_records})
+    if st.session_state.get("detail_date_filter") not in all_dates:
+        st.session_state["detail_date_filter"] = "All dates"
+    if st.session_state.get("detail_class_filter") not in all_classes:
+        st.session_state["detail_class_filter"] = "All classes"
+
+    method_col, method_run_button_col = st.columns([3, 1])
+    with method_col:
+        st.selectbox("Method", [POINT_CLOUD_MODEL_NAME], key="detail_point_cloud_method")
+    method_run_button_placeholder = method_run_button_col.empty()
+    st.markdown(
+        "<style>.st-key-method_run_button_nudge { margin-top: 12px; }"
+        ".st-key-detail_point_cloud_tabs button[role='tab']:not(:first-of-type)"
+        " { pointer-events: none; opacity: 0.35; }</style>",
+        unsafe_allow_html=True,
+    )
+
+    filter_cols = st.columns([1, 1], gap="large")
+    with filter_cols[0]:
+        selected_date = st.selectbox("Date filter", all_dates, key="detail_date_filter")
+    with filter_cols[1]:
+        selected_class = st.selectbox("Class filter", all_classes, key="detail_class_filter")
+
+    filtered = image_records
+    if selected_date != "All dates":
+        filtered = [record for record in filtered if record["date"] == selected_date]
+    if selected_class != "All classes":
+        filtered = [record for record in filtered if record["label"] == selected_class]
+
+    if not filtered:
+        st.info("No point clouds matched the selected filter.")
+        return
+
+    select_options = list(dict.fromkeys(record["path"] for record in filtered))
+    previous_selected_paths = [
+        path for path in st.session_state.get("detail_point_cloud_selected_paths", []) if path in select_options
+    ]
+    selected_paths = st.multiselect(
+        "Select point clouds",
+        options=select_options,
+        default=previous_selected_paths,
+        format_func=lambda path: Path(path).name,
+        key="detail_point_cloud_multi_select",
+    )
+    st.session_state["detail_point_cloud_selected_paths"] = selected_paths
+    record_by_path = {record["path"]: record for record in image_records}
+    selected_records = [record_by_path[path] for path in selected_paths if path in record_by_path]
+
+    with method_run_button_placeholder.container():
+        with st.container(key="method_run_button_nudge"):
+            st.write("")
+            _render_point_cloud_run_button(selected_records)
+
+    if not selected_records:
+        st.info("Select point clouds above, then click **Run**.")
+        return
+
+    with st.container(key="detail_point_cloud_tabs"):
+        tab1, tab2, tab3 = st.tabs(["Result", "3D Visualization", "XAI"])
+    with tab1:
+        _render_point_cloud_result_tab(selected_records)
+    with tab2:
+        st.info("3D Visualization is not available for 3D point cloud data.")
+    with tab3:
+        st.info("XAI is not available for 3D point cloud data.")
+
+
 def render_detail_page(image_records) -> None:
     render_page_header("Analysis")
+    if _is_point_cloud_records(image_records):
+        render_point_cloud_detail_page(image_records)
+        return
     all_dates = ["All dates"] + sorted({record["date"] for record in image_records}, reverse=True)
     all_classes = ["All classes"] + sorted({record["label"] for record in image_records})
     _apply_requested_selectbox_value(

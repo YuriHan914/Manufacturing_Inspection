@@ -23,8 +23,17 @@ from scripts.local_gemma_model import (
     generate_response,
     is_model_downloaded,
 )
+from scripts.point_cloud_inference import (
+    POINT_CLOUD_MODEL_NAME,
+    build_point_cloud_score_figure,
+    load_point_cloud_results,
+    load_result_full_cloud,
+    result_for_path,
+    run_point_cloud_inference,
+)
 from scripts.utils import (
     CLASS_VISUALIZATION_ORDER,
+    SUPPORTED_IMAGE_SUFFIXES,
     PDF_FONT_CANDIDATES,
     _apply_inference_labels_to_records,
     _build_runs_from_labeled_records,
@@ -273,7 +282,11 @@ def build_summary_analysis_comment(
         return "The local Gemma model is not ready, so the analysis comment could not be generated.", sample_records
 
     prompt = build_summary_analysis_prompt(latest_run, trends, sample_records)
-    image_paths = tuple(record["path"] for record in sample_records if record["exists"])
+    image_paths = tuple(
+        record["path"]
+        for record in sample_records
+        if record["exists"] and Path(str(record["path"])).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
+    )
     cache_key = f"{latest_run['name']}|{len(image_paths)}|{latest_run['bad_count']}|{latest_run['good_count']}"
     try:
         comment = generate_summary_analysis_comment_cached(
@@ -793,12 +806,121 @@ def render_classification_inference_section(
         return image_records, False
 
 
+def render_point_cloud_inference_section(
+    config: dict[str, Any],
+    image_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool, float]:
+    """3D-KD anomaly detection for the 3D point-cloud table.
+
+    Results are saved under outputs/3D-AD (see scripts/point_cloud_inference.py). When every file in
+    the query period already has a saved result, it is loaded and applied without another click.
+    Returns (records, inference_applied, average_inference_ms).
+    """
+    query_date_start, query_date_end = _resolve_query_period(config)
+    period_caption = f"{query_date_start} ~ {query_date_end}" if query_date_start and query_date_end else "All dates"
+    candidate_paths = [record["path"] for record in image_records if record.get("exists")]
+
+    with st.container(border=True):
+        st.subheader("Anomaly Detection Inference")
+        st.selectbox("Inference model", [POINT_CLOUD_MODEL_NAME], key="summary_point_cloud_model")
+
+        saved_results = load_point_cloud_results()
+        pending_paths = [path for path in candidate_paths if result_for_path(saved_results, path) is None]
+        st.caption(
+            f"Query period: {period_caption} | {len(candidate_paths)} point cloud(s) in range | "
+            f"{len(pending_paths)} pending inference"
+        )
+        run_label = "Run Inference" if pending_paths else "Re-run Inference"
+        if st.button(run_label, key="summary_run_point_cloud_inference_button", disabled=not candidate_paths):
+            target_paths = pending_paths or candidate_paths
+            normal_reference_paths = [
+                record["path"] for record in image_records if record.get("source_label") == "Normal"
+            ]
+            progress = st.progress(0.0, text="Running 3D-KD inference...")
+            try:
+                saved_results = run_point_cloud_inference(
+                    target_paths,
+                    normal_reference_paths,
+                    progress_callback=lambda done, total, name: progress.progress(
+                        done / total, text=f"3D-KD inference: {name} ({done}/{total})"
+                    ),
+                )
+            except Exception as exc:
+                progress.empty()
+                st.error(f"3D-KD inference failed: {exc}")
+                return image_records, False, 0.0
+            progress.empty()
+            st.success(f"Inference complete: {len(target_paths)} point cloud(s) inferred and saved to outputs/3D-AD.")
+
+        result_by_path = {
+            path: result for path in candidate_paths if (result := result_for_path(saved_results, path)) is not None
+        }
+        if not result_by_path:
+            st.info("Showing stored labels. Click **Run Inference** to detect anomalies with the 3D-KD model.")
+            return image_records, False, 0.0
+
+        if len(result_by_path) < len(candidate_paths):
+            st.warning(
+                f"Saved 3D-KD results cover {len(result_by_path)} of {len(candidate_paths)} point clouds; "
+                "the rest show stored labels."
+            )
+
+        result_frame = pd.DataFrame(
+            [
+                {
+                    "file": result["name"],
+                    "prediction": result["label"],
+                    "max score": result["max_score"],
+                    "image threshold": result["image_threshold"],
+                    "anomalous points (%)": result["anomalous_point_ratio"],
+                    "inference ms": result["inference_ms"],
+                    "inferred at": result["created_at"],
+                }
+                for result in result_by_path.values()
+            ]
+        )
+        st.dataframe(result_frame, width="stretch", hide_index=True)
+
+        viewer_options = {result["name"]: result for result in result_by_path.values()}
+        selected_name = st.selectbox("3D anomaly score view", list(viewer_options), key="summary_point_cloud_viewer")
+        selected_result = viewer_options[selected_name]
+        full_cloud = load_result_full_cloud(selected_result)
+        if full_cloud is not None:
+            point_threshold = float(selected_result["point_threshold"])
+            st.plotly_chart(
+                build_point_cloud_score_figure(
+                    *full_cloud,
+                    point_threshold,
+                    f"{selected_name}_full  (point threshold={point_threshold:.3f})",
+                    max_points=None,
+                ),
+                width="stretch",
+                key="summary_point_cloud_plot",
+            )
+        else:
+            st.caption("The saved full point cloud (_full.ply) for this file was not found. Re-run inference to regenerate it.")
+
+        label_by_path = {path: str(result["label"]) for path, result in result_by_path.items()}
+        inference_values = [float(result["inference_ms"]) for result in result_by_path.values()]
+        average_inference_ms = sum(inference_values) / len(inference_values) if inference_values else 0.0
+        return _apply_inference_labels_to_records(image_records, label_by_path), True, average_inference_ms
+
+
 def render_summary_page(config, runs, image_records) -> None:
     render_page_header("Summary")
 
-    image_records, inference_applied = render_classification_inference_section(config, image_records)
-    if inference_applied:
-        runs = _build_runs_from_labeled_records(image_records)
+    if str(config.get("data_source", "")).startswith("point_cloud"):
+        image_records, inference_applied, average_inference_ms = render_point_cloud_inference_section(
+            config, image_records
+        )
+        if inference_applied:
+            runs = _build_runs_from_labeled_records(image_records)
+            for run in runs:
+                run["average_inference_ms"] = average_inference_ms
+    else:
+        image_records, inference_applied = render_classification_inference_section(config, image_records)
+        if inference_applied:
+            runs = _build_runs_from_labeled_records(image_records)
 
     summary_run = build_aggregate_run(runs)
     trends = build_trend_data(summary_run)
