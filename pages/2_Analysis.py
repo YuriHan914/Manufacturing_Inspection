@@ -1728,7 +1728,7 @@ def render_point_cloud_detail_page(image_records: list[dict[str, Any]]) -> None:
         path for path in st.session_state.get("detail_point_cloud_selected_paths", []) if path in select_options
     ]
     selected_paths = st.multiselect(
-        "Select point clouds",
+        "Select Sample",
         options=select_options,
         default=previous_selected_paths,
         format_func=lambda path: Path(path).name,
@@ -1744,7 +1744,7 @@ def render_point_cloud_detail_page(image_records: list[dict[str, Any]]) -> None:
             _render_point_cloud_run_button(selected_records)
 
     if not selected_records:
-        st.info("Select point clouds above, then click **Run**.")
+        st.info("Select samples above, then click **Run**.")
         return
 
     with st.container(key="detail_point_cloud_tabs"):
@@ -1982,7 +1982,7 @@ def render_fusion_detail_page(image_records: list[dict[str, Any]]) -> None:
         path for path in st.session_state.get("detail_fusion_selected_paths", []) if path in select_options
     ]
     selected_paths = st.multiselect(
-        "Select objects",
+        "Select Sample",
         options=select_options,
         default=previous_selected_paths,
         format_func=lambda path: Path(path).name,
@@ -1998,7 +1998,7 @@ def render_fusion_detail_page(image_records: list[dict[str, Any]]) -> None:
             _render_fusion_run_button(selected_records)
 
     if not selected_records:
-        st.info("Select objects above, then click **Run**.")
+        st.info("Select samples above, then click **Run**.")
         return
 
     with st.container(key="detail_fusion_tabs"):
@@ -2073,7 +2073,7 @@ def render_detail_page(image_records) -> None:
     previous_selected_paths = list(st.session_state.get("detail_selected_image_paths", []))
     selected_paths = [path for path in previous_selected_paths if path in select_options]
     selected_paths = st.multiselect(
-        "Select images",
+        "Select Sample",
         options=select_options,
         default=selected_paths,
         format_func=lambda path: Path(path).name,
