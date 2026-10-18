@@ -1,0 +1,61 @@
+{
+  "n": 64000,
+  "s": 1,
+  "m": 4,
+  "out_dir": "/mnt/data/github/Anomaly-Detection/2D-3D/Data/2D-3D",
+  "tag": "n64000_s1_m4",
+  "pose_root": "/mnt/data/Dataset/SiM3D/rubbish_bin",
+  "products": [
+    "01",
+    "02",
+    "03",
+    "04",
+    "05",
+    "06",
+    "07",
+    "08",
+    "09",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18",
+    "19",
+    "20"
+  ],
+  "views": null,
+  "resample": false,
+  "seed": 0,
+  "device": "cuda",
+  "utonia_ckpt": "./utonia.pth",
+  "utonia_stages": [
+    2,
+    3
+  ],
+  "utonia_scale": 6.0,
+  "utonia_grid": 0.01,
+  "no_flash": false,
+  "resnet_layers": [
+    "layer2",
+    "layer3"
+  ],
+  "agg_2d": 3,
+  "fusion_dim": 256,
+  "fusion_kernel": 1,
+  "fusion_pool": "mean",
+  "bank_keep": 0.1,
+  "coreset_ratio": 0.1,
+  "proj_dim": 128,
+  "save_features": false,
+  "n_views": 240,
+  "pool_size": 1536000,
+  "bank_shape": [
+    153600,
+    256
+  ],
+  "elapsed_sec": 1811.4
+}
