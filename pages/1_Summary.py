@@ -23,6 +23,14 @@ from scripts.local_gemma_model import (
     generate_response,
     is_model_downloaded,
 )
+from scripts.fusion_inference import (
+    FUSION_MODEL_NAME,
+    fusion_result_for_path,
+    load_display_thumbnail,
+    load_fusion_results,
+    load_fusion_view_scores,
+    run_fusion_inference,
+)
 from scripts.point_cloud_inference import (
     POINT_CLOUD_MODEL_NAME,
     build_point_cloud_score_figure,
@@ -906,10 +914,122 @@ def render_point_cloud_inference_section(
         return _apply_inference_labels_to_records(image_records, label_by_path), True, average_inference_ms
 
 
+def _render_fusion_view_grid(result: dict[str, Any], columns: int = 6) -> None:
+    """All view heatmaps of one object as small images, `columns` per row (12 views -> 6 x 2)."""
+    views = load_fusion_view_scores(result)
+    if views is None:
+        st.caption("The saved per-view heatmaps for this object were not found. Re-run inference to regenerate them.")
+        return
+    rows = list(views.itertuples())
+    for start in range(0, len(rows), columns):
+        cols = st.columns(columns, gap="small")
+        for col, row in zip(cols, rows[start:start + columns]):
+            with col:
+                if Path(row.image_path).is_file():
+                    st.image(load_display_thumbnail(row.image_path), width="stretch")
+                else:
+                    st.caption("image not found")
+                status = " · :red[**ABNORMAL**]" if row.abnormal else ""
+                st.caption(f"view {int(row.view):02d} · {row.view_score:.4f} / {row.threshold:.4f}{status}")
+
+
+def render_fusion_inference_section(
+    config: dict[str, Any],
+    image_records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool, float]:
+    """2D-3D AD anomaly detection for the 2D-3D table (one record = one 12-view object).
+
+    Results are saved under outputs/2D-3D (see scripts/fusion_inference.py). When every object in
+    the query period already has a saved result, it is loaded and applied without another click.
+    Returns (records, inference_applied, average_inference_ms).
+    """
+    query_date_start, query_date_end = _resolve_query_period(config)
+    period_caption = f"{query_date_start} ~ {query_date_end}" if query_date_start and query_date_end else "All dates"
+    candidate_paths = [record["path"] for record in image_records if record.get("exists")]
+
+    with st.container(border=True):
+        st.subheader("Anomaly Detection Inference")
+        st.selectbox("Inference model", [FUSION_MODEL_NAME], key="summary_fusion_model")
+
+        saved_results = load_fusion_results()
+        pending_paths = [path for path in candidate_paths if fusion_result_for_path(saved_results, path) is None]
+        st.caption(
+            f"Query period: {period_caption} | {len(candidate_paths)} object(s) in range | "
+            f"{len(pending_paths)} pending inference"
+        )
+        run_label = "Run Inference" if pending_paths else "Re-run Inference"
+        if st.button(run_label, key="summary_run_fusion_inference_button", disabled=not candidate_paths):
+            target_paths = pending_paths or candidate_paths
+            progress = st.progress(0.0, text=f"Loading {FUSION_MODEL_NAME} models...")
+            try:
+                saved_results = run_fusion_inference(
+                    target_paths,
+                    progress_callback=lambda done, total, name: progress.progress(
+                        done / total, text=f"{FUSION_MODEL_NAME} inference: {name} ({done}/{total} views)"
+                    ),
+                )
+            except Exception as exc:
+                progress.empty()
+                st.error(f"{FUSION_MODEL_NAME} inference failed:\n\n```\n{exc}\n```")
+                return image_records, False, 0.0
+            progress.empty()
+            st.success(f"Inference complete: {len(target_paths)} object(s) inferred and saved to outputs/2D-3D.")
+
+        result_by_path = {
+            path: result
+            for path in candidate_paths
+            if (result := fusion_result_for_path(saved_results, path)) is not None
+        }
+        if not result_by_path:
+            st.info(f"Showing stored labels. Click **Run Inference** to detect anomalies with the {FUSION_MODEL_NAME} model.")
+            return image_records, False, 0.0
+
+        if len(result_by_path) < len(candidate_paths):
+            st.warning(
+                f"Saved {FUSION_MODEL_NAME} results cover {len(result_by_path)} of {len(candidate_paths)} objects; "
+                "the rest show stored labels."
+            )
+
+        result_frame = pd.DataFrame(
+            [
+                {
+                    "object": result["name"],
+                    "prediction": result["label"],
+                    "abnormal views": f"{int(result['n_abnormal_views'])} / {int(result['n_views'])}",
+                    "abnormal view ids": result["abnormal_views"] or "-",
+                    "max view score": result["object_score"],
+                    "anomalous points (%)": result["anomalous_point_ratio"],
+                    "views": result["n_views"],
+                    "inference ms": result["inference_ms"],
+                    "inferred at": result["created_at"],
+                }
+                for result in result_by_path.values()
+            ]
+        )
+        st.dataframe(result_frame, width="stretch", hide_index=True)
+
+        viewer_options = {result["name"]: result for result in result_by_path.values()}
+        selected_name = st.selectbox("2D anomaly heatmaps", list(viewer_options), key="summary_fusion_viewer")
+        _render_fusion_view_grid(viewer_options[selected_name])
+
+        label_by_path = {path: str(result["label"]) for path, result in result_by_path.items()}
+        inference_values = [float(result["inference_ms"]) for result in result_by_path.values()]
+        average_inference_ms = sum(inference_values) / len(inference_values) if inference_values else 0.0
+        return _apply_inference_labels_to_records(image_records, label_by_path), True, average_inference_ms
+
+
 def render_summary_page(config, runs, image_records) -> None:
     render_page_header("Summary")
 
-    if str(config.get("data_source", "")).startswith("point_cloud"):
+    if str(config.get("data_source", "")).startswith("fusion_2d3d"):
+        image_records, inference_applied, average_inference_ms = render_fusion_inference_section(
+            config, image_records
+        )
+        if inference_applied:
+            runs = _build_runs_from_labeled_records(image_records)
+            for run in runs:
+                run["average_inference_ms"] = average_inference_ms
+    elif str(config.get("data_source", "")).startswith("point_cloud"):
         image_records, inference_applied, average_inference_ms = render_point_cloud_inference_section(
             config, image_records
         )

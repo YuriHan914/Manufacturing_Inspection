@@ -33,6 +33,17 @@ AD_OUTPUT_DIR = ROOT_DIR / "outputs" / "AD"
 
 from scripts.classifier_runtime import get_default_classifier_runtime
 from scripts.detail_finetune_mcp import CLASSIFIER_MODEL_DIR, resolve_base_model_dir
+from scripts.fusion_inference import (
+    FUSION_MODEL_NAME,
+    fusion_result_for_path,
+    load_fusion_color_range,
+    load_fusion_object_cloud,
+    load_fusion_results,
+    build_zoomable_image_figure,
+    load_fusion_view_scores,
+    run_fusion_inference,
+    to_display_frame,
+)
 from scripts.point_cloud_inference import (
     POINT_CLOUD_MODEL_NAME,
     build_point_cloud_score_figure,
@@ -1746,8 +1757,265 @@ def render_point_cloud_detail_page(image_records: list[dict[str, Any]]) -> None:
         st.info("XAI is not available for 3D point cloud data.")
 
 
+def _is_fusion_records(image_records: list[dict[str, Any]]) -> bool:
+    return any(str(record.get("data_source", "")).startswith("fusion_2d3d") for record in image_records)
+
+
+def _render_fusion_run_button(selected_records: list[dict[str, Any]]) -> None:
+    """Run 2D-3D AD on the selected objects. Objects with a saved result in outputs/2D-3D are loaded
+    instead of re-inferred; the rest are inferred and saved there."""
+    selected_paths = [record["path"] for record in selected_records if record.get("exists")]
+    run_clicked = st.button("Run", key="detail_fusion_run_button", width="stretch", disabled=not selected_paths)
+    if not run_clicked:
+        return
+
+    saved_results = load_fusion_results()
+    pending_paths = [path for path in selected_paths if fusion_result_for_path(saved_results, path) is None]
+    if pending_paths:
+        progress = st.progress(0.0, text=f"Loading {FUSION_MODEL_NAME} models...")
+        try:
+            run_fusion_inference(
+                pending_paths,
+                progress_callback=lambda done, total, name: progress.progress(
+                    done / total, text=f"{FUSION_MODEL_NAME} inference: {name} ({done}/{total} views)"
+                ),
+            )
+        except Exception as exc:
+            progress.empty()
+            st.error(f"{FUSION_MODEL_NAME} inference failed:\n\n```\n{exc}\n```")
+            _append_app_log(
+                log_type="error",
+                source="Analysis",
+                content=f"{FUSION_MODEL_NAME} inference failed for {len(pending_paths)} object(s): {exc}",
+            )
+            return
+        progress.empty()
+    _append_app_log(
+        log_type="done",
+        source="Analysis",
+        content=(
+            f"{FUSION_MODEL_NAME} run on {len(selected_paths)} object(s): "
+            f"{len(pending_paths)} newly inferred, {len(selected_paths) - len(pending_paths)} loaded from outputs/2D-3D."
+        ),
+    )
+    st.session_state["detail_fusion_run_signature"] = tuple(sorted(selected_paths))
+    st.rerun()
+
+
+def _render_fusion_view_scores(result: dict[str, Any]) -> None:
+    views = load_fusion_view_scores(result)
+    if views is None:
+        st.caption("The saved per-view scores for this object were not found. Re-run inference to regenerate them.")
+        return
+    import plotly.graph_objects as go
+
+    view_names = [f"view {int(view):02d}" for view in views["view"]]
+    fig = go.Figure(
+        [
+            go.Bar(
+                x=view_names,
+                y=views["view_score"],
+                name="view score",
+                marker_color=["#d62728" if abnormal else "#1f77b4" for abnormal in views["abnormal"]],
+                customdata=views["threshold"],
+                hovertemplate="%{x}<br>view score %{y:.4f}<br>threshold %{customdata:.4f}<extra></extra>",
+            ),
+            go.Scatter(
+                x=view_names,
+                y=views["threshold"],
+                name="view threshold",
+                mode="lines+markers",
+                line=dict(color="#555555", dash="dash", shape="hvh"),
+                hoverinfo="skip",
+            ),
+        ]
+    )
+    low = float(min(views["view_score"].min(), views["threshold"].min()))
+    high = float(max(views["view_score"].max(), views["threshold"].max()))
+    fig.update_layout(
+        title="View scores vs. per-view thresholds (red = abnormal view)",
+        yaxis=dict(range=[low * 0.9, high * 1.05]),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=320,
+    )
+    st.plotly_chart(fig, width="stretch", key=f"detail_fusion_view_scores_{result['name']}")
+
+    view_labels = {
+        f"view {int(row.view):02d}  (score {row.view_score:.4f} / threshold {row.threshold:.4f})"
+        f"{'  ABNORMAL' if row.abnormal else ''}": row.image_path
+        for row in views.itertuples()
+    }
+    # Always open on view 12 (last view if the object has no view 12).
+    view_numbers = views["view"].astype(int).tolist()
+    selected_view = st.selectbox(
+        "2D anomaly heatmap",
+        list(view_labels),
+        index=view_numbers.index(12) if 12 in view_numbers else len(view_numbers) - 1,
+        key=f"detail_fusion_view_select_{result['name']}",
+    )
+    image_path = Path(view_labels[selected_view])
+    if image_path.is_file():
+        image_fig, image_width, image_height = build_zoomable_image_figure(image_path)
+        # Keep the image's aspect ratio as the container height scales with the column width, so the row
+        # (and the 3D plot next to it) still resizes with the window.
+        container_key = f"detail_fusion_heatmap_{result['name']}"
+        st.markdown(
+            f"<style>.st-key-{container_key} {{ aspect-ratio: {image_width} / {image_height}; }}</style>",
+            unsafe_allow_html=True,
+        )
+        with st.container(key=container_key):
+            st.plotly_chart(
+                image_fig,
+                width="stretch",
+                height="stretch",
+                config={"scrollZoom": True, "displaylogo": False},
+                key=f"detail_fusion_heatmap_plot_{result['name']}",
+            )
+        st.caption(f"{selected_view} · mouse wheel: zoom, drag: pan, double-click: reset")
+    else:
+        st.caption(f"Heatmap image not found: {image_path.name}. Re-run inference to regenerate it.")
+
+
+# Make the 3D plot fill its column without contributing to the row height. With height="stretch" alone the plot's
+# own height keeps the row tall, so it grows with the window but never shrinks back.
+_FUSION_CLOUD_FILL_CSS = """<style>
+div[data-testid="stColumn"]:has([class*="st-key-detail_fusion_cloud_"]) { position: relative; }
+[class*="st-key-detail_fusion_cloud_"] { position: absolute; inset: 0; }
+</style>"""
+
+
+def _render_fusion_result_tab(selected_records: list[dict[str, Any]]) -> None:
+    selected_paths = [record["path"] for record in selected_records if record.get("exists")]
+    if st.session_state.get("detail_fusion_run_signature") != tuple(sorted(selected_paths)):
+        st.info(f"Click **Run** to detect anomalies in the selected objects with {FUSION_MODEL_NAME}.")
+        return
+
+    saved_results = load_fusion_results()
+    color_range = load_fusion_color_range()
+    st.markdown(_FUSION_CLOUD_FILL_CSS, unsafe_allow_html=True)
+    for record in selected_records:
+        result = fusion_result_for_path(saved_results, record["path"])
+        with st.container(border=True):
+            if result is None:
+                st.warning(f"{record['filename']}: no {FUSION_MODEL_NAME} result found. Click **Run** again.")
+                continue
+            st.markdown(f"**{result['name']}**  ·  {int(result['n_views'])} views (ply + image)")
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Prediction", str(result["label"]))
+            metric_cols[1].metric("Max view score", f"{float(result['object_score']):.4f}")
+            metric_cols[2].metric(
+                "Abnormal views",
+                f"{int(result['n_abnormal_views'])} / {int(result['n_views'])}",
+                help="Hard voting: the object is Anomaly when at least one view score exceeds its view threshold. "
+                + (f"Abnormal views: {result['abnormal_views']}" if result["abnormal_views"] else "No abnormal view."),
+            )
+            metric_cols[3].metric("Anomalous points", f"{float(result['anomalous_point_ratio']):.2f}%")
+
+            cloud_col, view_col = st.columns([1, 1], gap="large")
+            with cloud_col:
+                object_cloud = load_fusion_object_cloud(result)
+                if object_cloud is None:
+                    st.caption("The saved object point cloud for this object was not found. Re-run inference to regenerate it.")
+                else:
+                    points, scores = object_cloud
+                    # The plot is taken out of the layout flow (see _FUSION_CLOUD_FILL_CSS) so the row height comes
+                    # from the right column alone; the plot then fills the left column and follows it on resize.
+                    with st.container(key=f"detail_fusion_cloud_{result['name']}"):
+                        st.plotly_chart(
+                            build_point_cloud_score_figure(
+                                to_display_frame(points),
+                                scores,
+                                float(result["point_threshold"]),
+                                f"{result['name']} 12-view object (mm)",
+                                max_points=None,
+                                color_range=color_range,
+                                height=None,
+                            ),
+                            width="stretch",
+                            height="stretch",
+                            key=f"detail_fusion_plot_{result['name']}",
+                        )
+            with view_col:
+                _render_fusion_view_scores(result)
+
+
+def render_fusion_detail_page(image_records: list[dict[str, Any]]) -> None:
+    """Analysis page for the 2D-3D table: 2D-3D AD is the only method and only the Result tab is active
+    (3D Visualization / XAI are image-feature based and do not apply to 2D-3D objects)."""
+    all_dates = ["All dates"] + sorted({record["date"] for record in image_records}, reverse=True)
+    all_classes = ["All classes"] + sorted({record["label"] for record in image_records})
+    if st.session_state.get("detail_date_filter") not in all_dates:
+        st.session_state["detail_date_filter"] = "All dates"
+    if st.session_state.get("detail_class_filter") not in all_classes:
+        st.session_state["detail_class_filter"] = "All classes"
+
+    method_col, method_run_button_col = st.columns([3, 1])
+    with method_col:
+        st.selectbox("Method", [FUSION_MODEL_NAME], key="detail_fusion_method")
+    method_run_button_placeholder = method_run_button_col.empty()
+    st.markdown(
+        "<style>.st-key-method_run_button_nudge { margin-top: 12px; }"
+        ".st-key-detail_fusion_tabs button[role='tab']:not(:first-of-type)"
+        " { pointer-events: none; opacity: 0.35; }</style>",
+        unsafe_allow_html=True,
+    )
+
+    filter_cols = st.columns([1, 1], gap="large")
+    with filter_cols[0]:
+        selected_date = st.selectbox("Date filter", all_dates, key="detail_date_filter")
+    with filter_cols[1]:
+        selected_class = st.selectbox("Class filter", all_classes, key="detail_class_filter")
+
+    filtered = image_records
+    if selected_date != "All dates":
+        filtered = [record for record in filtered if record["date"] == selected_date]
+    if selected_class != "All classes":
+        filtered = [record for record in filtered if record["label"] == selected_class]
+
+    if not filtered:
+        st.info("No 2D-3D objects matched the selected filter.")
+        return
+
+    select_options = list(dict.fromkeys(record["path"] for record in filtered))
+    previous_selected_paths = [
+        path for path in st.session_state.get("detail_fusion_selected_paths", []) if path in select_options
+    ]
+    selected_paths = st.multiselect(
+        "Select objects",
+        options=select_options,
+        default=previous_selected_paths,
+        format_func=lambda path: Path(path).name,
+        key="detail_fusion_multi_select",
+    )
+    st.session_state["detail_fusion_selected_paths"] = selected_paths
+    record_by_path = {record["path"]: record for record in image_records}
+    selected_records = [record_by_path[path] for path in selected_paths if path in record_by_path]
+
+    with method_run_button_placeholder.container():
+        with st.container(key="method_run_button_nudge"):
+            st.write("")
+            _render_fusion_run_button(selected_records)
+
+    if not selected_records:
+        st.info("Select objects above, then click **Run**.")
+        return
+
+    with st.container(key="detail_fusion_tabs"):
+        tab1, tab2, tab3 = st.tabs(["Result", "3D Visualization", "XAI"])
+    with tab1:
+        _render_fusion_result_tab(selected_records)
+    with tab2:
+        st.info("3D Visualization is not available for 2D-3D data.")
+    with tab3:
+        st.info("XAI is not available for 2D-3D data.")
+
+
 def render_detail_page(image_records) -> None:
     render_page_header("Analysis")
+    if _is_fusion_records(image_records):
+        render_fusion_detail_page(image_records)
+        return
     if _is_point_cloud_records(image_records):
         render_point_cloud_detail_page(image_records)
         return
