@@ -72,11 +72,21 @@ SUPABASE_KEY = "abcdefghij"
 - 3D 포인트 클라우드 이상 탐지 (`3D-KD`)
   <p align="center"><img src="../assets/3D-AD.png" alt="Analysis - 3D Anomaly Detection" width="500"/></p>
 
-  - Dashboard 페이지에서 `3D Rubbish bin` 테이블을 선택하면 Analysis 페이지가 3D 포인트 클라우드 모드로 전환됩니다.
-  - `Method`는 `3D-KD`(Teacher–Student 지식 증류)만 사용할 수 있습니다.
-  - `Select point clouds`에서 포인트 클라우드(`.ply`)를 선택한 뒤 `Run`을 클릭합니다. `outputs/3D-AD`에 저장된 결과가 있으면 다시 추론하지 않고 불러오며, 나머지는 추론 후 해당 폴더에 저장합니다.
+  - Dashboard 페이지의 'Query Setting[Data Source]'에서 `3D Rubbish bin` 테이블을 선택 후 'Load Data' 클릭합니다.(Date는 default 사용)
+  - `Method`는 `3D-KD`만 사용할 수 있습니다.
+  - `Select Sample`에서 포인트 클라우드(`.ply`)를 선택한 뒤 `Run`을 클릭합니다. `outputs/3D-AD`에 저장된 결과가 있으면 다시 추론하지 않고 불러오며, 나머지는 추론 후 해당 폴더에 저장합니다.
   - `Result` 탭에서는 포인트 클라우드별 `Prediction`(Normal/Anomaly), `Max score`, `Image threshold`, `Anomalous points`(%)와 함께, 포인트별 이상 점수로 색칠된 인터랙티브 3D 뷰를 보여줍니다.
   - 포인트 클라우드 데이터에서는 `3D Visualization`과 `XAI` 탭을 사용할 수 없습니다.
+
+- 2D-3D 멀티모달 이상 탐지 (`2D-3D AD`)
+  <p align="center"><img src="../assets/2D-3D-AD.png" alt="Analysis - 2D-3D Anomaly Detection" width="500"/></p>
+
+  - Dashboard 페이지의 'Query Setting[Data Source]'에서 `2D-3D Rubbish bin` 테이블을 선택 후 'Load Data' 클릭합니다.(Date는 default 사용)
+  - `Method`는 `2D-3D AD`만 사용할 수 있습니다.
+  - `Select Sample`에서 샘플 데이터를 선택한 뒤 `Run`을 클릭하여 분석합니다.
+  - `Result` 탭에서는 이상 점수로 색칠된 포인트 클라우드와 이미지 데이터를 확인 가능하며 view 별로 anomaly score 분포를 막대그래프로 확인가능합니다.
+  - `2D-3D AD`에서는 `3D Visualization`과 `XAI` 탭을 사용할 수 없습니다.
+
 ## 5. Setting
 <p align="center"><img src="../assets/Settings.png" alt="Settings" width="500"/></p>
 

@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [v0.8.0] - 2026-10-18
+
+### Added
+
+* Added 2D-3D multimodal anomaly detection with `2D-3D AD` (Utonia point features + ResNet-101 image features fused per point, scored against a PatchCore memory bank) — a new `2D-3D Rubbish bin` table (`data/2D-3D`, one record per 12-view object, dated 2026-01-01) can be selected on the Dashboard page
+* Added 2D-3D AD to the Analysis and Summary pages: each view is judged abnormal when its view score exceeds that view's threshold in `model/2D-3D/object_level_thresholds.csv`, and an object is predicted Anomaly by hard voting (at least one abnormal view); shows prediction, abnormal views, max view score, and anomalous point ratio, plus a 3D view of the merged 12-view object colored by anomaly score, per-view scores, and per-view 2D heatmaps projected onto the camera images; results are saved under `outputs/2D-3D` and reused instead of being run again
+* Inference runs `scripts/2D-3D/infer_app.py` in the `utonia` conda env (override with `FUSION_2D3D_PYTHON`); the Utonia checkpoint `model/2D-3D/utonia.pth` is downloaded from HuggingFace (`Pointcept/Utonia`) when missing, and the anomalous-point threshold / color range come from `model/2D-3D/calibration.json`
+* Fine-tuning is disabled for the 2D-3D table
+* The Analysis Result tab shows the 2D-3D object point cloud after a fixed display transform (`FUSION_DISPLAY_PLY_T3 @ FUSION_DISPLAY_PLY_T2 @ FUSION_DISPLAY_PLY_T1` in `scripts/fusion_inference.py`) and the heatmap images rotated 180°, with view score / threshold as the image caption; scoring still runs on the original ply and images
+* The 2D heatmap on the Analysis Result tab is a Plotly image (`scrollZoom`, `dragmode="pan"`): mouse wheel zooms, drag pans, double-click resets; it opens on view 12
+* The Summary page shows the selected object's 12 view heatmaps (rotated 180°) as small images in a 6 x 2 grid, with view score / threshold and abnormal views marked, instead of the 3D view
+
+### Changed
+
+* Renamed the sample selector on the Analysis page to `Select Sample` for every data source (previously `Select images`, `Select point clouds`, or `Select objects` depending on the selected table)
+
+---
+
 ## [v0.7.0] - 2026-10-01
 
 ### Added

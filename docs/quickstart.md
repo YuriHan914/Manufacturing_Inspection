@@ -71,11 +71,20 @@ SUPABASE_KEY = "abcdefghij"
 - 3D point cloud anomaly detection (`3D-KD`)
   <p align="center"><img src="../assets/3D-AD.png" alt="Analysis - 3D Anomaly Detection" width="500"/></p>
 
-  - When the `3D Rubbish bin` table is selected on the Dashboard page, the Analysis page switches to 3D point cloud mode.
-  - `3D-KD` (teacher–student knowledge distillation) is the only available `Method`.
-  - Choose point clouds (`.ply`) in `Select point clouds`, then click `Run`. Results already saved in `outputs/3D-AD` are loaded instead of re-inferred; the rest are inferred and saved there.
+  - On the Dashboard page, select the `3D Rubbish bin` table in 'Query Setting[Data Source]', then click 'Load Data'. (Use the default Date.)
+  - `3D-KD` is the only available `Method`.
+  - Choose point clouds (`.ply`) in `Select Sample`, then click `Run`. Results already saved in `outputs/3D-AD` are loaded instead of re-inferred; the rest are inferred and saved there.
   - The `Result` tab shows each point cloud's `Prediction` (Normal/Anomaly), `Max score`, `Image threshold`, and `Anomalous points` (%), along with an interactive 3D view colored by per-point anomaly score.
   - The `3D Visualization` and `XAI` tabs are not available for point cloud data.
+
+- 2D-3D multimodal anomaly detection (`2D-3D AD`)
+  <p align="center"><img src="../assets/2D-3D-AD.png" alt="Analysis - 2D-3D Anomaly Detection" width="500"/></p>
+
+  - On the Dashboard page, select the `2D-3D Rubbish bin` table in 'Query Setting[Data Source]', then click 'Load Data'. (Use the default Date.)
+  - `2D-3D AD` is the only available `Method`.
+  - Choose samples in `Select Sample`, then click `Run` to analyze them.
+  - The `Result` tab shows the point cloud colored by anomaly score together with the image data, plus a bar chart of the anomaly score distribution for each view.
+  - The `3D Visualization` and `XAI` tabs are not available in `2D-3D AD`.
 
 ## 5. Setting
 <p align="center"><img src="../assets/Settings.png" alt="Settings" width="500"/></p>
