@@ -23,3 +23,14 @@ tensorrt>=11.0.0,<12.0.0
 plotly
 fpsample
 trimesh
+
+# The `utonia` package itself is installed from source; torch-scatter wheels must match torch/CUDA (here torch 2.8.0 + cu128).
+# flash-attn builds against the installed torch: pip install flash-attn --no-build-isolation
+--find-links https://data.pyg.org/whl/torch-2.8.0+cu128.html
+spconv-cu128>=2.3.8,<3.0.0
+torch-scatter>=2.1.2,<3.0.0
+flash-attn>=2.8.0,<3.0.0
+timm>=1.0.0,<2.0.0
+addict>=2.4.0,<3.0.0
+scipy>=1.14.0,<2.0.0
+open3d>=0.19.0,<1.0.0
