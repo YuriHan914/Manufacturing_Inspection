@@ -111,5 +111,9 @@ streamlit run Dashboard.py
 
 
 #### 참고 자료
-- 데이터 출처 : [Semiconductor](https://www.kaggle.com/datasets/drtawfikrrahman/multi-class-semiconductor-wafer-image-dataset)
+- 데이터 출처 : [Semiconductor](https://www.kaggle.com/datasets/drtawfikrrahman/multi-class-semiconductor-wafer-image-dataset), [Rubbish Bin](https://huggingface.co/datasets/arcanoXIII/SiM3D)
 - 모델 : [Mobilevit_small](https://huggingface.co/apple/mobilevit-small)
+- 논문    
+  [1] Roth, Karsten, et al. "Towards total recall in industrial anomaly detection." 2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR). IEEE, 2022.    
+  [2] Bergmann, Paul, and David Sattlegger. "Anomaly detection in 3d point clouds using deep geometric descriptors." 2023 IEEE/CVF Winter Conference on Applications of Computer Vision (WACV). IEEE, 2023.    
+  [3] Wang, Yue, et al. "Multimodal industrial anomaly detection via hybrid fusion." 2023 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR). IEEE, 2023.    
