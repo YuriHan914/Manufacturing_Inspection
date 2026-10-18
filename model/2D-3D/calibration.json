@@ -1,0 +1,8 @@
+{
+  "point_threshold": 0.2142,
+  "vmin": 0.1131,
+  "vmax": 0.2917,
+  "cmap": "jet",
+  "k_nn": 3,
+  "source": "GOOD products 01-20, 240 views, leave-one-product-out scores (n64000_s1_m4). point_threshold = p99.5 of normal point scores (anomalous point ratio), vmin/vmax = visualize_score color_range (p1 / p99.9 of all scores). View / object decisions use object_level_thresholds.csv."
+}

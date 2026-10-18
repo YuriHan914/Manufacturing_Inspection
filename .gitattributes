@@ -1,1 +1,2 @@
 data/memory_bank/*.npy filter=lfs diff=lfs merge=lfs -text
+model/2D-3D/*.npy filter=lfs diff=lfs merge=lfs -text
